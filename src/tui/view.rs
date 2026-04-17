@@ -7,13 +7,16 @@ use ratatui::widgets::{Block, Borders, Paragraph, Scrollbar, ScrollbarOrientatio
 use crate::session::{ConversationMessage, MessageRole};
 
 use super::table;
-use super::{App, ContentSearchState, Mode};
+use super::{App, ContentSearchState, Mode, TreeRow};
 
 /// Render the full TUI frame.
 pub fn render(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
 
-    if app.mode == Mode::Conversation || app.mode == Mode::ConversationSearch {
+    let in_conversation = app.mode == Mode::Conversation
+        || app.mode == Mode::ConversationSearch
+        || (app.mode == Mode::TitleEdit && app.conversation.is_some());
+    if in_conversation {
         render_conversation(frame, app, area);
         return;
     }
@@ -25,13 +28,26 @@ pub fn render(frame: &mut Frame, app: &mut App) {
 
     render_session_list(frame, app, chunks[0]);
     render_status_bar(frame, app, chunks[1]);
+
+    if app.mode == Mode::MoveSelectProject {
+        render_move_picker(frame, app, area);
+    }
 }
 
 /// Render the session list with single-line entries.
 fn render_session_list(frame: &mut Frame, app: &App, area: Rect) {
-    let width = area.width.saturating_sub(2) as usize; // account for left/right borders
+    if app.grouped_view {
+        render_grouped_session_list(frame, app, area);
+    } else {
+        render_flat_session_list(frame, app, area);
+    }
+}
+
+/// Render the flat (ungrouped) session list.
+fn render_flat_session_list(frame: &mut Frame, app: &App, area: Rect) {
+    let width = area.width.saturating_sub(2) as usize;
     let height = area.height as usize;
-    let visible_items = height.saturating_sub(2); // account for top/bottom borders
+    let visible_items = height.saturating_sub(2);
     let mut lines: Vec<Line> = Vec::new();
 
     let terms = search_terms(app);
@@ -56,8 +72,9 @@ fn render_session_list(frame: &mut Frame, app: &App, area: Rect) {
             ("  ", 2)
         };
 
+        let label = app.session_display_label(session);
         let max_msg_len = width.saturating_sub(cursor_len + right_len + 2);
-        let msg = truncate_str(&session.first_message, max_msg_len);
+        let msg = truncate_str(&label, max_msg_len);
         let msg_len = msg.chars().count();
         let pad = width.saturating_sub(cursor_len + msg_len + right_len);
         let padding = " ".repeat(pad);
@@ -69,7 +86,6 @@ fn render_session_list(frame: &mut Frame, app: &App, area: Rect) {
         };
 
         let dim = Style::default().fg(app.theme.text_dim);
-
         let cursor_style = Style::default().fg(app.theme.cursor_color);
 
         let mut spans = vec![Span::styled(cursor, cursor_style)];
@@ -101,7 +117,6 @@ fn render_session_list(frame: &mut Frame, app: &App, area: Rect) {
     let paragraph = Paragraph::new(text).block(block);
     frame.render_widget(paragraph, area);
 
-    // Render vertical scrollbar
     let total = app.display_entries.len();
     let visible = area.height.saturating_sub(2) as usize;
     if total > visible {
@@ -122,6 +137,206 @@ fn render_session_list(frame: &mut Frame, app: &App, area: Rect) {
     }
 }
 
+/// Render the grouped (tree) session list with collapsible project headers.
+fn render_grouped_session_list(frame: &mut Frame, app: &App, area: Rect) {
+    let width = area.width.saturating_sub(2) as usize;
+    let height = area.height as usize;
+    let visible_items = height.saturating_sub(2);
+    let mut lines: Vec<Line> = Vec::new();
+
+    let terms = search_terms(app);
+    let term_refs: Vec<&str> = terms.iter().map(|s| s.as_str()).collect();
+
+    let start = app.scroll_offset;
+    let end = (start + visible_items).min(app.tree_rows.len());
+
+    for i in start..end {
+        let row = &app.tree_rows[i];
+        let is_selected = i == app.selected;
+
+        match row {
+            TreeRow::Project(gi) => {
+                let group = &app.project_groups[*gi];
+                let icon = if group.expanded { "\u{25BC}" } else { "\u{25B6}" };
+                let count = group.session_indices.len();
+                let label = format!("{} {} ({})", icon, group.name, count);
+                let label_len = label.chars().count();
+                let pad = width.saturating_sub(label_len + 1);
+                let padding = " ".repeat(pad);
+
+                let style = if is_selected {
+                    Style::default().fg(app.theme.cursor_color).bold()
+                } else {
+                    Style::default().fg(app.theme.heading).bold()
+                };
+
+                let line = Line::from(vec![
+                    Span::styled(" ", Style::default()),
+                    Span::styled(label, style),
+                    Span::raw(padding),
+                ]);
+
+                if is_selected {
+                    lines.push(line.patch_style(Style::default().bg(app.theme.selected_bg)));
+                } else {
+                    lines.push(line);
+                }
+            }
+            TreeRow::Session { display_idx, .. } => {
+                let entry = &app.display_entries[*display_idx];
+                let session = app.display_session(entry);
+
+                let delta = Utc::now().signed_duration_since(session.timestamp);
+                let time_ago = HumanTime::from(-delta).to_text_en(Accuracy::Rough, Tense::Past);
+                let right = format!("  {}", time_ago);
+                let right_len = right.len();
+
+                let indent = "    ";
+                let indent_len = 4;
+                let (cursor, cursor_len) = if is_selected {
+                    ("\u{27A4} ", 2)
+                } else {
+                    ("- ", 2)
+                };
+
+                let label = app.session_display_label(session);
+                let max_msg_len = width.saturating_sub(indent_len + cursor_len + right_len + 2);
+                let msg = truncate_str(&label, max_msg_len);
+                let msg_len = msg.chars().count();
+                let pad = width.saturating_sub(indent_len + cursor_len + msg_len + right_len);
+                let padding = " ".repeat(pad);
+
+                let msg_style = if is_selected {
+                    Style::default().fg(Color::White)
+                } else {
+                    Style::default().fg(app.theme.text)
+                };
+
+                let dim = Style::default().fg(app.theme.text_dim);
+                let cursor_style = Style::default().fg(app.theme.cursor_color);
+
+                let mut spans = vec![
+                    Span::raw(indent),
+                    Span::styled(cursor, cursor_style),
+                ];
+                spans.extend(highlight_terms(&msg, &term_refs, msg_style, &app.theme));
+                spans.push(Span::raw(padding));
+                spans.push(Span::styled(right, dim));
+
+                let line = Line::from(spans);
+
+                if is_selected {
+                    lines.push(line.patch_style(Style::default().bg(app.theme.selected_bg)));
+                } else {
+                    lines.push(line);
+                }
+            }
+        }
+    }
+
+    let session_count: usize = app.project_groups.iter()
+        .map(|g| g.session_indices.len())
+        .sum();
+    let text = Text::from(lines);
+    let border_style = Style::default().fg(app.theme.text_dim);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(border_style)
+        .title(format!(
+            " cc-session ({}/{}) \u{2500} {} projects ",
+            session_count,
+            app.sessions.len(),
+            app.project_groups.len(),
+        ))
+        .title_style(Style::default().fg(app.theme.cursor_color).bold());
+
+    let paragraph = Paragraph::new(text).block(block);
+    frame.render_widget(paragraph, area);
+
+    let total = app.tree_rows.len();
+    let visible = area.height.saturating_sub(2) as usize;
+    if total > visible {
+        let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+            .thumb_style(Style::default().fg(app.theme.text_dim))
+            .begin_symbol(None)
+            .end_symbol(None);
+        let mut scrollbar_state =
+            ScrollbarState::new(total.saturating_sub(visible)).position(app.scroll_offset);
+        frame.render_stateful_widget(
+            scrollbar,
+            area.inner(Margin {
+                vertical: 1,
+                horizontal: 0,
+            }),
+            &mut scrollbar_state,
+        );
+    }
+}
+
+/// Render the move-to-project picker as a centered overlay.
+fn render_move_picker(frame: &mut Frame, app: &App, area: Rect) {
+    let state = match &app.move_state {
+        Some(s) => s,
+        None => return,
+    };
+
+    let max_w = 50u16.min(area.width.saturating_sub(4));
+    let max_h = (state.projects.len() as u16 + 2).min(area.height.saturating_sub(4)).max(4);
+    let x = (area.width.saturating_sub(max_w)) / 2;
+    let y = (area.height.saturating_sub(max_h)) / 2;
+    let popup_area = Rect::new(x, y, max_w, max_h);
+
+    let clear = ratatui::widgets::Clear;
+    frame.render_widget(clear, popup_area);
+
+    let inner_w = max_w.saturating_sub(2) as usize;
+    let inner_h = max_h.saturating_sub(2) as usize;
+
+    let visible_start = if state.selected >= inner_h {
+        state.selected - inner_h + 1
+    } else {
+        0
+    };
+    let visible_end = (visible_start + inner_h).min(state.projects.len());
+
+    let mut lines: Vec<Line> = Vec::new();
+    for i in visible_start..visible_end {
+        let (_, ref name, _) = state.projects[i];
+        let is_sel = i == state.selected;
+        let (prefix, style) = if is_sel {
+            ("\u{27A4} ", Style::default().fg(app.theme.cursor_color).bold())
+        } else {
+            ("  ", Style::default().fg(app.theme.text))
+        };
+        let label = if name.chars().count() + 2 > inner_w {
+            let truncated: String = name.chars().take(inner_w.saturating_sub(5)).collect();
+            format!("{truncated}...")
+        } else {
+            name.clone()
+        };
+        let pad = inner_w.saturating_sub(prefix.chars().count() + label.chars().count());
+        let line = Line::from(vec![
+            Span::styled(prefix, style),
+            Span::styled(label, style),
+            Span::raw(" ".repeat(pad)),
+        ]);
+        if is_sel {
+            lines.push(line.patch_style(Style::default().bg(app.theme.selected_bg)));
+        } else {
+            lines.push(line);
+        }
+    }
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(app.theme.cursor_color))
+        .title(" Move to project ")
+        .title_style(Style::default().fg(app.theme.cursor_color).bold());
+
+    let paragraph = Paragraph::new(Text::from(lines)).block(block);
+    frame.render_widget(paragraph, popup_area);
+}
+
 const MAX_CONTENT_WIDTH: u16 = 120;
 
 /// Render the conversation viewer.
@@ -134,29 +349,34 @@ fn render_conversation(frame: &mut Frame, app: &mut App, area: Rect) {
     let full_content_area = chunks[0];
     let status_area = chunks[1];
 
-    // Build title: show match position during search, nothing otherwise
-    let title_extra = if let Some(conv) = &app.conversation {
+    // Build title bar: session name + search match info
+    let session_title = app.conversation.as_ref()
+        .and_then(|conv| conv.session.custom_title.as_deref())
+        .unwrap_or("");
+
+    let search_info = if let Some(conv) = &app.conversation {
         let has_search = conv.search_confirmed || !conv.initial_search_terms.is_empty();
         if has_search && !conv.match_positions.is_empty() {
-            format!(
-                " ({}/{}) ",
-                conv.current_match + 1,
-                conv.match_positions.len()
-            )
+            format!(" ({}/{})", conv.current_match + 1, conv.match_positions.len())
         } else {
-            String::from(" ")
+            String::new()
         }
     } else {
-        String::from(" ")
+        String::new()
     };
 
-    // Draw border around the full area with title
+    let title_text = if session_title.is_empty() {
+        format!(" cc-session{search_info} ")
+    } else {
+        format!(" {session_title}{search_info} ")
+    };
+
     let border_style = Style::default().fg(app.theme.text_dim);
     let title_style = Style::default().fg(app.theme.cursor_color).bold();
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(border_style)
-        .title(format!(" cc-session{title_extra}"))
+        .title(title_text)
         .title_style(title_style);
     let inner_area = block.inner(full_content_area);
     frame.render_widget(block, full_content_area);
@@ -273,7 +493,9 @@ fn render_conversation(frame: &mut Frame, app: &mut App, area: Rect) {
 
 /// Render the conversation viewer status bar.
 fn render_conversation_status(frame: &mut Frame, app: &App, area: Rect) {
-    let content = if let Some(conv) = &app.conversation {
+    let content = if app.mode == Mode::TitleEdit {
+        render_title_edit_bar(app)
+    } else if let Some(conv) = &app.conversation {
         let dim = Style::default().fg(app.theme.text_dim);
         let label_style = Style::default()
             .fg(app.theme.status_label_fg)
@@ -351,7 +573,7 @@ fn render_conversation_status(frame: &mut Frame, app: &App, area: Rect) {
                 ),
                 Span::raw(" "),
                 Span::styled(
-                    "Space/b scroll  g/G top/bottom  / search  Enter copy & exit  Esc back",
+                    "Space/b scroll  / search  t title  f fork  Enter resume  Esc back",
                     dim,
                 ),
             ])
@@ -689,13 +911,88 @@ fn wrap_line(line: &str, width: usize) -> Vec<String> {
     result
 }
 
+/// Render the title edit input bar.
+fn render_title_edit_bar(app: &App) -> Line<'static> {
+    let dim = Style::default().fg(app.theme.text_dim);
+    let label_style = Style::default()
+        .fg(app.theme.status_label_fg)
+        .bg(app.theme.status_label_bg)
+        .bold();
+
+    if let Some(state) = &app.title_edit {
+        let is_new = matches!(state.context, super::TitleEditContext::NewSession { .. });
+        let label = if is_new { " New session: " } else { " Title: " };
+        let hint = if is_new {
+            "Enter create  Esc cancel  (empty = no name)"
+        } else {
+            "Enter save  Esc cancel  (clear to remove title)"
+        };
+
+        let mut spans = vec![
+            Span::styled(label.to_string(), label_style),
+            Span::styled(" ", Style::default()),
+        ];
+
+        let cursor_pos = state.cursor.min(state.query.len());
+        let (before, rest) = state.query.split_at(cursor_pos);
+        if !before.is_empty() {
+            spans.push(Span::styled(before.to_string(), Style::default().fg(Color::White)));
+        }
+        if let Some(ch) = rest.chars().next() {
+            spans.push(Span::styled(
+                ch.to_string(),
+                Style::default().fg(Color::Black).bg(Color::White),
+            ));
+            let after = &rest[ch.len_utf8()..];
+            if !after.is_empty() {
+                spans.push(Span::styled(after.to_string(), Style::default().fg(Color::White)));
+            }
+        } else {
+            spans.push(Span::styled(
+                " ".to_string(),
+                Style::default().fg(Color::Black).bg(Color::White),
+            ));
+        }
+
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(hint, dim));
+
+        Line::from(spans)
+    } else {
+        Line::from("")
+    }
+}
+
 /// Render the status/help bar at the bottom.
 fn render_status_bar(frame: &mut Frame, app: &App, area: Rect) {
     let dim = Style::default().fg(app.theme.text_dim);
     let content = match app.mode {
         Mode::Conversation | Mode::ConversationSearch => Line::from(""),
-        Mode::Browsing => {
-            if let Some((msg, _)) = &app.status_message {
+        Mode::TitleEdit => render_title_edit_bar(app),
+        Mode::MoveSelectProject => {
+            let key_style = Style::default().fg(Color::White).bold();
+            Line::from(vec![
+                Span::styled(" Select target project: ", Style::default().fg(app.theme.cursor_color).bold()),
+                Span::styled("↑↓", key_style),
+                Span::styled(" navigate  ", dim),
+                Span::styled("Enter", key_style),
+                Span::styled(" confirm  ", dim),
+                Span::styled("Esc", key_style),
+                Span::styled(" cancel", dim),
+            ])
+        }
+        Mode::ConfirmArchive | Mode::Browsing => {
+            if app.archive_confirm.is_some() {
+                let warn_style = Style::default().fg(Color::Yellow).bold();
+                let key_style = Style::default().fg(Color::White).bold();
+                Line::from(vec![
+                    Span::styled(" Archive this session? ", warn_style),
+                    Span::styled("y", key_style),
+                    Span::styled(" yes  ", dim),
+                    Span::styled("any other key", key_style),
+                    Span::styled(" cancel", dim),
+                ])
+            } else if let Some((msg, _)) = &app.status_message {
                 Line::from(vec![Span::styled(
                     format!(" {msg}"),
                     Style::default().fg(Color::Green).bold(),
@@ -734,12 +1031,31 @@ fn render_status_bar(frame: &mut Frame, app: &App, area: Rect) {
                     Span::styled("Esc clear  Enter select", dim),
                 ])
             } else {
+                let view_hint = if app.grouped_view {
+                    "Tab flat view"
+                } else {
+                    "Tab grouped view"
+                };
                 Line::from(vec![
                     Span::styled(" Enter ", dim),
                     Span::styled("detail", dim),
                     Span::raw("  "),
+                    Span::styled("t ", dim),
+                    Span::styled("title", dim),
+                    Span::raw("  "),
+                    Span::styled("n ", dim),
+                    Span::styled("new", dim),
+                    Span::raw("  "),
+                    Span::styled("a ", dim),
+                    Span::styled("archive", dim),
+                    Span::raw("  "),
+                    Span::styled("m ", dim),
+                    Span::styled("move", dim),
+                    Span::raw("  "),
                     Span::styled("Esc ", dim),
                     Span::styled("quit", dim),
+                    Span::raw("  "),
+                    Span::styled(view_hint, dim),
                     Span::raw("  "),
                     Span::styled("(type to search)", dim),
                 ])

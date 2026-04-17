@@ -18,7 +18,6 @@ use crossterm::terminal::{
 };
 use ratatui::prelude::*;
 
-use crate::clipboard;
 use crate::discovery::{get_claude_home, load_conversation};
 use crate::filter::filter_sessions;
 use crate::search;
@@ -33,6 +32,9 @@ pub enum Mode {
     Browsing,
     Conversation,
     ConversationSearch,
+    ConfirmArchive,
+    MoveSelectProject,
+    TitleEdit,
 }
 
 /// Phase of the background content search.
@@ -74,7 +76,125 @@ pub enum Action {
     Quit,
     EnterConversation(usize),
     CopyCommand(String),
+    NewSession(String),
+    ForkSession(String),
     BackToList,
+    ArchiveSession(usize),
+    MoveSession { display_idx: usize, target_project: String, target_cwd: String },
+}
+
+/// A group of sessions belonging to the same project directory.
+#[derive(Debug, Clone)]
+pub struct ProjectGroup {
+    pub name: String,
+    pub path: String,
+    pub cwd: String,
+    pub session_indices: Vec<usize>,
+    pub expanded: bool,
+}
+
+/// A single row in the tree view: either a project header or a session under it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TreeRow {
+    Project(usize),
+    Session { project_idx: usize, display_idx: usize },
+}
+
+/// Build project groups from a flat list of sessions.
+/// Groups are sorted by the latest session timestamp (newest group first).
+/// Sessions within each group are ordered by their position in `display_entries`.
+pub fn group_by_project(sessions: &[Session], display_entries: &[DisplayEntry]) -> Vec<ProjectGroup> {
+    group_by_project_with_content(sessions, display_entries, &[])
+}
+
+/// Build project groups, including content-only search results.
+pub fn group_by_project_with_content(sessions: &[Session], display_entries: &[DisplayEntry], content_results: &[Session]) -> Vec<ProjectGroup> {
+    let mut group_map: std::collections::HashMap<String, Vec<usize>> = std::collections::HashMap::new();
+
+    for (di, entry) in display_entries.iter().enumerate() {
+        let session = match &entry.source {
+            DisplaySource::Sessions(idx) => &sessions[*idx],
+            DisplaySource::Content(idx) => &content_results[*idx],
+        };
+        group_map
+            .entry(session.project_path.clone())
+            .or_default()
+            .push(di);
+    }
+
+    let mut groups: Vec<ProjectGroup> = group_map
+        .into_iter()
+        .map(|(path, indices)| {
+            let first_session = indices.first()
+                .and_then(|&di| {
+                    match &display_entries.get(di)?.source {
+                        DisplaySource::Sessions(idx) => sessions.get(*idx),
+                        DisplaySource::Content(idx) => content_results.get(*idx),
+                    }
+                });
+            let name = first_session
+                .map(|s| s.project_name.clone())
+                .unwrap_or_else(|| "unknown".to_string());
+            let cwd = first_session
+                .map(|s| s.cwd.clone())
+                .unwrap_or_default();
+            ProjectGroup {
+                name,
+                path,
+                cwd,
+                session_indices: indices,
+                expanded: false,
+            }
+        })
+        .collect();
+
+    // Sort groups by latest activity (newest first)
+    groups.sort_by(|a, b| {
+        let ts_a = a.session_indices.first()
+            .map(|&i| display_entries[i].timestamp)
+            .unwrap_or_else(|| DateTime::<Utc>::MIN_UTC);
+        let ts_b = b.session_indices.first()
+            .map(|&i| display_entries[i].timestamp)
+            .unwrap_or_else(|| DateTime::<Utc>::MIN_UTC);
+        ts_b.cmp(&ts_a)
+    });
+
+    groups
+}
+
+/// Build the flat list of tree rows from project groups, respecting expanded state.
+pub fn build_tree_rows(groups: &[ProjectGroup]) -> Vec<TreeRow> {
+    let mut rows = Vec::new();
+    for (gi, group) in groups.iter().enumerate() {
+        rows.push(TreeRow::Project(gi));
+        if group.expanded {
+            for &di in &group.session_indices {
+                rows.push(TreeRow::Session { project_idx: gi, display_idx: di });
+            }
+        }
+    }
+    rows
+}
+
+/// State for the project picker when moving a session.
+pub struct MoveState {
+    pub display_idx: usize,
+    pub projects: Vec<(String, String, String)>,  // (encoded_path, display_name, cwd)
+    pub selected: usize,
+}
+
+/// What the title edit is for.
+pub enum TitleEditContext {
+    Rename { session_id: String },
+    NewSession { cwd: String },
+}
+
+/// State for title editing.
+pub struct TitleEditState {
+    pub context: TitleEditContext,
+    pub query: String,
+    pub cursor: usize,
+    pub return_mode: Mode,
 }
 
 /// State for the conversation viewer.
@@ -128,10 +248,22 @@ pub struct App {
     pub theme: Theme,
     /// Syntax highlighter for code blocks.
     pub syntax_highlighter: syntax::SyntaxHighlighter,
+    /// Project groups for tree view.
+    pub project_groups: Vec<ProjectGroup>,
+    /// Flattened tree rows for the grouped view.
+    pub tree_rows: Vec<TreeRow>,
+    /// Whether the grouped (tree) view is active.
+    pub grouped_view: bool,
+    /// Pending archive confirmation: display_idx of session to archive.
+    pub archive_confirm: Option<usize>,
+    /// State for the move-to-project picker.
+    pub move_state: Option<MoveState>,
+    /// Title being edited.
+    pub title_edit: Option<TitleEditState>,
 }
 
 impl App {
-    pub fn new(sessions: Vec<Session>, session_index: HashMap<PathBuf, Session>, theme: Theme) -> Self {
+    pub fn new(sessions: Vec<Session>, session_index: HashMap<PathBuf, Session>, theme: Theme, grouped_view: bool) -> Self {
         let filtered_indices: Vec<usize> = (0..sessions.len()).collect();
         let display_entries: Vec<DisplayEntry> = filtered_indices
             .iter()
@@ -141,6 +273,8 @@ impl App {
                 timestamp: sessions[idx].timestamp,
             })
             .collect();
+        let project_groups = group_by_project(&sessions, &display_entries);
+        let tree_rows = build_tree_rows(&project_groups);
         Self {
             sessions,
             filtered_indices,
@@ -161,6 +295,12 @@ impl App {
             session_index: Arc::new(session_index),
             theme,
             syntax_highlighter: syntax::SyntaxHighlighter::new(),
+            project_groups,
+            tree_rows,
+            grouped_view,
+            archive_confirm: None,
+            move_state: None,
+            title_edit: None,
         }
     }
 
@@ -213,6 +353,55 @@ impl App {
 
         entries.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
         self.display_entries = entries;
+        self.rebuild_tree_rows();
+    }
+
+    /// Rebuild project groups and tree rows from current display entries.
+    pub fn rebuild_tree_rows(&mut self) {
+        let old_expanded: HashMap<String, bool> = self.project_groups
+            .iter()
+            .map(|g| (g.path.clone(), g.expanded))
+            .collect();
+        self.project_groups = group_by_project_with_content(
+            &self.sessions,
+            &self.display_entries,
+            &self.content_results,
+        );
+        for group in &mut self.project_groups {
+            if let Some(&was_expanded) = old_expanded.get(&group.path) {
+                group.expanded = was_expanded;
+            }
+        }
+        self.tree_rows = build_tree_rows(&self.project_groups);
+    }
+
+    /// Toggle a project group's expanded/collapsed state.
+    pub fn toggle_project(&mut self, group_idx: usize) {
+        if group_idx < self.project_groups.len() {
+            self.project_groups[group_idx].expanded = !self.project_groups[group_idx].expanded;
+            self.tree_rows = build_tree_rows(&self.project_groups);
+        }
+    }
+
+    /// Toggle between flat list and grouped tree view.
+    pub fn toggle_view(&mut self) {
+        self.grouped_view = !self.grouped_view;
+        self.selected = 0;
+        self.scroll_offset = 0;
+    }
+
+    /// Get the currently selected tree row, if in grouped view.
+    pub fn selected_tree_row(&self) -> Option<&TreeRow> {
+        self.tree_rows.get(self.selected)
+    }
+
+    /// Total number of visible rows in the current view mode.
+    pub fn visible_row_count(&self) -> usize {
+        if self.grouped_view {
+            self.tree_rows.len()
+        } else {
+            self.display_entries.len()
+        }
     }
 
     /// Get the session referenced by a display entry.
@@ -234,8 +423,9 @@ impl App {
 
     /// Move the selection cursor down, clamped to bounds.
     pub fn move_down(&mut self) {
-        if !self.display_entries.is_empty() {
-            self.selected = (self.selected + 1).min(self.display_entries.len() - 1);
+        let count = self.visible_row_count();
+        if count > 0 {
+            self.selected = (self.selected + 1).min(count - 1);
         }
     }
 
@@ -294,6 +484,260 @@ impl App {
     pub fn leave_conversation(&mut self) {
         self.conversation = None;
         self.mode = Mode::Browsing;
+    }
+
+    /// Archive a session by moving its JSONL file to a projects-archive/ directory.
+    /// Returns Ok(session_name) on success.
+    pub fn archive_session(&mut self, display_idx: usize) -> Result<String, String> {
+        if display_idx >= self.display_entries.len() {
+            return Err("invalid index".to_string());
+        }
+        let entry = &self.display_entries[display_idx];
+        let session = self.display_session(entry).clone();
+
+        let claude_home = get_claude_home();
+        let src = claude_home
+            .join("projects")
+            .join(&session.project_path)
+            .join(format!("{}.jsonl", session.id));
+        let archive_dir = claude_home
+            .join("projects-archive")
+            .join(&session.project_path);
+
+        std::fs::create_dir_all(&archive_dir)
+            .map_err(|e| format!("failed to create archive dir: {e}"))?;
+
+        let dst = archive_dir.join(format!("{}.jsonl", session.id));
+        std::fs::rename(&src, &dst)
+            .map_err(|e| format!("failed to move session: {e}"))?;
+
+        let label = session.first_message.chars().take(40).collect::<String>();
+
+        match entry.source {
+            DisplaySource::Sessions(sidx) => {
+                self.sessions.remove(sidx);
+            }
+            DisplaySource::Content(cidx) => {
+                self.content_results.remove(cidx);
+            }
+        }
+        self.apply_filter();
+
+        Ok(label)
+    }
+
+    /// Start the move-to-project flow for a given session.
+    pub fn start_move(&mut self, display_idx: usize) {
+        if display_idx >= self.display_entries.len() {
+            return;
+        }
+        let entry = &self.display_entries[display_idx];
+        let current_path = self.display_session(entry).project_path.clone();
+
+        let mut seen = HashSet::new();
+        let mut projects: Vec<(String, String, String)> = Vec::new();
+        for s in &self.sessions {
+            if s.project_path == current_path {
+                continue;
+            }
+            if seen.insert(s.project_path.clone()) {
+                projects.push((s.project_path.clone(), s.project_name.clone(), s.cwd.clone()));
+            }
+        }
+
+        projects.sort_by(|a, b| a.1.to_lowercase().cmp(&b.1.to_lowercase()));
+
+        if projects.is_empty() {
+            self.set_status("No other projects to move to".to_string());
+            return;
+        }
+
+        self.move_state = Some(MoveState {
+            display_idx,
+            projects,
+            selected: 0,
+        });
+        self.mode = Mode::MoveSelectProject;
+    }
+
+    /// Move a session to a different project directory, updating cwd in the JSONL.
+    pub fn move_session(&mut self, display_idx: usize, target_encoded_dir: &str, target_cwd: &str) -> Result<String, String> {
+        if display_idx >= self.display_entries.len() {
+            return Err("invalid index".to_string());
+        }
+        let entry = &self.display_entries[display_idx];
+        let session = self.display_session(entry).clone();
+
+        let claude_home = get_claude_home();
+        let src = claude_home
+            .join("projects")
+            .join(&session.project_path)
+            .join(format!("{}.jsonl", session.id));
+
+        let dst_dir = claude_home.join("projects").join(target_encoded_dir);
+        std::fs::create_dir_all(&dst_dir)
+            .map_err(|e| format!("failed to create target dir: {e}"))?;
+
+        let content = std::fs::read_to_string(&src)
+            .map_err(|e| format!("failed to read session file: {e}"))?;
+        let old_cwd = &session.cwd;
+        let updated: String = content
+            .lines()
+            .map(|line| {
+                if let Ok(mut val) = serde_json::from_str::<serde_json::Value>(line) {
+                    if let Some(obj) = val.as_object_mut() {
+                        if obj.get("cwd").and_then(|v| v.as_str()) == Some(old_cwd) {
+                            obj.insert("cwd".to_string(), serde_json::Value::String(target_cwd.to_string()));
+                        }
+                    }
+                    serde_json::to_string(&val).unwrap_or_else(|_| line.to_string())
+                } else {
+                    line.to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let dst = dst_dir.join(format!("{}.jsonl", session.id));
+        std::fs::write(&dst, &updated)
+            .map_err(|e| format!("failed to write moved session: {e}"))?;
+        let _ = std::fs::remove_file(&src);
+
+        let label = session.first_message.chars().take(40).collect::<String>();
+        let target_name = std::path::Path::new(target_cwd)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(target_encoded_dir);
+
+        match entry.source {
+            DisplaySource::Sessions(sidx) => {
+                self.sessions.remove(sidx);
+            }
+            DisplaySource::Content(cidx) => {
+                self.content_results.remove(cidx);
+            }
+        }
+        self.apply_filter();
+
+        Ok(format!("{} → {}", label, target_name))
+    }
+
+    /// Start editing a title for the given session (rename).
+    pub fn start_title_edit(&mut self, session_id: String, return_mode: Mode) {
+        let existing = self.find_session(&session_id)
+            .and_then(|s| s.custom_title.clone())
+            .unwrap_or_default();
+        let cursor = existing.len();
+        self.title_edit = Some(TitleEditState {
+            context: TitleEditContext::Rename { session_id },
+            query: existing,
+            cursor,
+            return_mode,
+        });
+        self.mode = Mode::TitleEdit;
+    }
+
+    /// Start title input for a new session.
+    pub fn start_new_session_title(&mut self, cwd: String) {
+        self.title_edit = Some(TitleEditState {
+            context: TitleEditContext::NewSession { cwd },
+            query: String::new(),
+            cursor: 0,
+            return_mode: Mode::Browsing,
+        });
+        self.mode = Mode::TitleEdit;
+    }
+
+    /// Finish title editing. Returns an Action if the caller should execute it.
+    pub fn finish_title_edit(&mut self) -> Result<Option<Action>, String> {
+        let state = self.title_edit.take().ok_or("no title edit in progress")?;
+        let title = state.query.trim().to_string();
+
+        match state.context {
+            TitleEditContext::Rename { session_id } => {
+                if !title.is_empty() {
+                    let duplicate = self.sessions.iter()
+                        .chain(self.content_results.iter())
+                        .any(|s| s.id != session_id && s.custom_title.as_deref() == Some(&title));
+                    if duplicate {
+                        let cursor = title.len();
+                        self.title_edit = Some(TitleEditState {
+                            context: TitleEditContext::Rename { session_id },
+                            query: title,
+                            cursor,
+                            return_mode: state.return_mode,
+                        });
+                        self.mode = Mode::TitleEdit;
+                        return Err("title already in use".to_string());
+                    }
+                }
+
+                let project_path = self.find_session(&session_id)
+                    .map(|s| s.project_path.clone())
+                    .ok_or("session not found")?;
+
+                crate::titles::save_custom_title(&project_path, &session_id, &title)?;
+                self.update_session_title(&session_id, if title.is_empty() { None } else { Some(title) });
+                self.mode = state.return_mode;
+                Ok(None)
+            }
+            TitleEditContext::NewSession { cwd } => {
+                let escaped_cwd = cwd.replace('\'', "'\\''");
+
+                if title.is_empty() {
+                    self.mode = Mode::Browsing;
+                    return Ok(Some(Action::NewSession(format!("cd '{}' && claude", escaped_cwd))));
+                }
+
+                let duplicate = self.sessions.iter()
+                    .chain(self.content_results.iter())
+                    .any(|s| s.custom_title.as_deref() == Some(&title));
+                if duplicate {
+                    let cursor = title.len();
+                    self.title_edit = Some(TitleEditState {
+                        context: TitleEditContext::NewSession { cwd },
+                        query: title,
+                        cursor,
+                        return_mode: state.return_mode,
+                    });
+                    self.mode = Mode::TitleEdit;
+                    return Err("title already in use".to_string());
+                }
+
+                let escaped_title = title.replace('\'', "'\\''");
+                self.mode = Mode::Browsing;
+                Ok(Some(Action::NewSession(format!("cd '{}' && claude -n '{}'", escaped_cwd, escaped_title))))
+            }
+        }
+    }
+
+    /// Cancel title editing.
+    pub fn cancel_title_edit(&mut self) {
+        if let Some(state) = self.title_edit.take() {
+            self.mode = state.return_mode;
+        }
+    }
+
+    /// Get the display label for a session: custom_title if set, otherwise first_message.
+    pub fn session_display_label(&self, session: &Session) -> String {
+        session.custom_title.clone().unwrap_or_else(|| session.first_message.clone())
+    }
+
+    /// Find a session by ID across sessions and content_results.
+    fn find_session(&self, session_id: &str) -> Option<&Session> {
+        self.sessions.iter()
+            .chain(self.content_results.iter())
+            .find(|s| s.id == session_id)
+    }
+
+    /// Update custom_title on a session in memory.
+    fn update_session_title(&mut self, session_id: &str, title: Option<String>) {
+        for s in self.sessions.iter_mut().chain(self.content_results.iter_mut()) {
+            if s.id == session_id {
+                s.custom_title = title;
+                return;
+            }
+        }
     }
 
     /// Set a status message that disappears after a few seconds.
@@ -391,7 +835,7 @@ impl App {
 }
 
 /// Run the interactive TUI session picker.
-pub fn run(sessions: Vec<Session>, theme: Theme) -> Result<(), Box<dyn std::error::Error>> {
+pub fn run(sessions: Vec<Session>, theme: Theme, grouped_view: bool) -> Result<(), Box<dyn std::error::Error>> {
     if sessions.is_empty() {
         eprintln!("No sessions found.");
         return Ok(());
@@ -412,7 +856,7 @@ pub fn run(sessions: Vec<Session>, theme: Theme) -> Result<(), Box<dyn std::erro
 
     let claude_home = get_claude_home();
     let session_index = search::build_session_index(&claude_home, &sessions);
-    let mut app = App::new(sessions, session_index, theme);
+    let mut app = App::new(sessions, session_index, theme, grouped_view);
     let mut deferred_command: Option<String> = None;
 
     loop {
@@ -439,13 +883,36 @@ pub fn run(sessions: Vec<Session>, theme: Theme) -> Result<(), Box<dyn std::erro
                     Action::EnterConversation(idx) => {
                         app.enter_conversation(idx);
                     }
-                    Action::CopyCommand(cmd) => match clipboard::copy_to_clipboard(&cmd) {
-                        Ok(()) => break,
-                        Err(_) => {
-                            deferred_command = Some(cmd);
-                            break;
+                    Action::CopyCommand(cmd) | Action::NewSession(cmd) | Action::ForkSession(cmd) => {
+                        deferred_command = Some(cmd);
+                        break;
+                    }
+                    Action::ArchiveSession(display_idx) => {
+                        match app.archive_session(display_idx) {
+                            Ok(label) => {
+                                app.set_status(format!("Archived: {}", label));
+                                if app.selected >= app.visible_row_count() && app.selected > 0 {
+                                    app.selected -= 1;
+                                }
+                            }
+                            Err(e) => {
+                                app.set_status(format!("Archive failed: {}", e));
+                            }
                         }
-                    },
+                    }
+                    Action::MoveSession { display_idx, target_project, target_cwd } => {
+                        match app.move_session(display_idx, &target_project, &target_cwd) {
+                            Ok(label) => {
+                                app.set_status(format!("Moved: {}", label));
+                                if app.selected >= app.visible_row_count() && app.selected > 0 {
+                                    app.selected -= 1;
+                                }
+                            }
+                            Err(e) => {
+                                app.set_status(format!("Move failed: {}", e));
+                            }
+                        }
+                    }
                     Action::BackToList => {
                         app.leave_conversation();
                     }
@@ -460,7 +927,19 @@ pub fn run(sessions: Vec<Session>, theme: Theme) -> Result<(), Box<dyn std::erro
     terminal.show_cursor()?;
 
     if let Some(cmd) = deferred_command {
-        println!("{cmd}");
+        use std::process::Command;
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+        let status = Command::new(&shell)
+            .arg("-ic")
+            .arg(&cmd)
+            .status();
+        match status {
+            Ok(s) => std::process::exit(s.code().unwrap_or(1)),
+            Err(e) => {
+                eprintln!("Failed to exec: {e}");
+                println!("{cmd}");
+            }
+        }
     }
 
     Ok(())

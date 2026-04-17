@@ -3,7 +3,7 @@ use std::time::Instant;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use super::{Action, App, ContentSearchState, Mode};
+use super::{Action, App, ContentSearchState, Mode, TreeRow};
 
 /// Handle a key event and return the resulting action.
 pub fn handle_input(app: &mut App, key: KeyEvent) -> Action {
@@ -16,30 +16,75 @@ pub fn handle_input(app: &mut App, key: KeyEvent) -> Action {
         Mode::Browsing => handle_browse(app, key),
         Mode::Conversation => handle_conversation(app, key),
         Mode::ConversationSearch => handle_conversation_search(app, key),
+        Mode::ConfirmArchive => handle_confirm_archive(app, key),
+        Mode::MoveSelectProject => handle_move_select(app, key),
+        Mode::TitleEdit => handle_title_edit(app, key),
     }
 }
 
 fn handle_browse(app: &mut App, key: KeyEvent) -> Action {
     match key.code {
+        KeyCode::Tab | KeyCode::BackTab => {
+            app.toggle_view();
+            Action::Continue
+        }
         KeyCode::Esc => {
             if !app.filter_query.is_empty() || app.filter_active {
-                // First Escape: clear filter and deactivate
                 app.cancel_content_search();
                 app.filter_query.clear();
                 app.filter_active = false;
                 app.apply_filter();
                 Action::Continue
             } else {
-                // Second Escape (filter already empty): quit
                 Action::Quit
             }
         }
         KeyCode::Enter => {
-            if app.selected < app.display_entries.len() {
+            if app.grouped_view {
+                match app.selected_tree_row().cloned() {
+                    Some(TreeRow::Project(gi)) => {
+                        app.toggle_project(gi);
+                        Action::Continue
+                    }
+                    Some(TreeRow::Session { display_idx, .. }) => {
+                        Action::EnterConversation(display_idx)
+                    }
+                    None => Action::Continue,
+                }
+            } else if app.selected < app.display_entries.len() {
                 Action::EnterConversation(app.selected)
             } else {
                 Action::Continue
             }
+        }
+        KeyCode::Right => {
+            if app.grouped_view {
+                if let Some(TreeRow::Project(gi)) = app.selected_tree_row().cloned() {
+                    if !app.project_groups[gi].expanded {
+                        app.toggle_project(gi);
+                    }
+                }
+            }
+            Action::Continue
+        }
+        KeyCode::Left => {
+            if app.grouped_view {
+                match app.selected_tree_row().cloned() {
+                    Some(TreeRow::Project(gi)) => {
+                        if app.project_groups[gi].expanded {
+                            app.toggle_project(gi);
+                        }
+                    }
+                    Some(TreeRow::Session { project_idx, .. }) => {
+                        // Jump to parent project header
+                        if let Some(pos) = app.tree_rows.iter().position(|r| *r == TreeRow::Project(project_idx)) {
+                            app.selected = pos;
+                        }
+                    }
+                    None => {}
+                }
+            }
+            Action::Continue
         }
         KeyCode::Down => {
             app.move_down();
@@ -50,14 +95,12 @@ fn handle_browse(app: &mut App, key: KeyEvent) -> Action {
             Action::Continue
         }
         KeyCode::PageDown => {
-            // Jump down by a page
             for _ in 0..20 {
                 app.move_down();
             }
             Action::Continue
         }
         KeyCode::PageUp => {
-            // Jump up by a page
             for _ in 0..20 {
                 app.move_up();
             }
@@ -69,8 +112,9 @@ fn handle_browse(app: &mut App, key: KeyEvent) -> Action {
             Action::Continue
         }
         KeyCode::End => {
-            if !app.display_entries.is_empty() {
-                app.selected = app.display_entries.len() - 1;
+            let count = app.visible_row_count();
+            if count > 0 {
+                app.selected = count - 1;
             }
             Action::Continue
         }
@@ -92,10 +136,71 @@ fn handle_browse(app: &mut App, key: KeyEvent) -> Action {
             Action::Continue
         }
         KeyCode::Char(c) => {
-            // First '/' activates filter mode visually without adding to query
             if c == '/' && app.filter_query.is_empty() && !app.filter_active {
                 app.filter_active = true;
                 return Action::Continue;
+            }
+            if c == 'a' && !app.filter_active {
+                let display_idx = if app.grouped_view {
+                    match app.selected_tree_row().cloned() {
+                        Some(TreeRow::Session { display_idx, .. }) => Some(display_idx),
+                        _ => None,
+                    }
+                } else if app.selected < app.display_entries.len() {
+                    Some(app.selected)
+                } else {
+                    None
+                };
+                if let Some(idx) = display_idx {
+                    app.archive_confirm = Some(idx);
+                    app.mode = Mode::ConfirmArchive;
+                    return Action::Continue;
+                }
+            }
+            if c == 'n' && !app.filter_active && app.grouped_view {
+                let cwd = match app.selected_tree_row().cloned() {
+                    Some(TreeRow::Project(gi)) => Some(app.project_groups[gi].cwd.clone()),
+                    Some(TreeRow::Session { project_idx, .. }) => Some(app.project_groups[project_idx].cwd.clone()),
+                    None => None,
+                };
+                if let Some(cwd) = cwd.filter(|c| !c.is_empty()) {
+                    app.start_new_session_title(cwd);
+                    return Action::Continue;
+                }
+            }
+            if c == 't' && !app.filter_active {
+                let display_idx = if app.grouped_view {
+                    match app.selected_tree_row().cloned() {
+                        Some(TreeRow::Session { display_idx, .. }) => Some(display_idx),
+                        _ => None,
+                    }
+                } else if app.selected < app.display_entries.len() {
+                    Some(app.selected)
+                } else {
+                    None
+                };
+                if let Some(idx) = display_idx {
+                    let entry = &app.display_entries[idx];
+                    let session_id = app.display_session(entry).id.clone();
+                    app.start_title_edit(session_id, Mode::Browsing);
+                    return Action::Continue;
+                }
+            }
+            if c == 'm' && !app.filter_active {
+                let display_idx = if app.grouped_view {
+                    match app.selected_tree_row().cloned() {
+                        Some(TreeRow::Session { display_idx, .. }) => Some(display_idx),
+                        _ => None,
+                    }
+                } else if app.selected < app.display_entries.len() {
+                    Some(app.selected)
+                } else {
+                    None
+                };
+                if let Some(idx) = display_idx {
+                    app.start_move(idx);
+                    return Action::Continue;
+                }
             }
             app.filter_active = true;
             app.filter_query.push(c);
@@ -190,6 +295,21 @@ fn handle_conversation(app: &mut App, key: KeyEvent) -> Action {
         KeyCode::Char('N') => {
             jump_to_prev_match(app);
             Action::Continue
+        }
+        KeyCode::Char('t') => {
+            if let Some(conv) = &app.conversation {
+                let session_id = conv.session.id.clone();
+                app.start_title_edit(session_id, Mode::Conversation);
+            }
+            Action::Continue
+        }
+        KeyCode::Char('f') => {
+            if let Some(conv) = &app.conversation {
+                let cmd = conv.session.fork_command();
+                Action::ForkSession(cmd)
+            } else {
+                Action::Continue
+            }
         }
         KeyCode::Char('/') => {
             if let Some(conv) = &mut app.conversation {
@@ -303,6 +423,128 @@ fn handle_conversation_search(app: &mut App, key: KeyEvent) -> Action {
             Action::Continue
         }
         _ => Action::Continue,
+    }
+}
+
+fn handle_move_select(app: &mut App, key: KeyEvent) -> Action {
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('q') => {
+            app.move_state = None;
+            app.mode = Mode::Browsing;
+            Action::Continue
+        }
+        KeyCode::Enter => {
+            if let Some(state) = app.move_state.take() {
+                let (target, _, cwd) = &state.projects[state.selected];
+                let target = target.clone();
+                let cwd = cwd.clone();
+                app.mode = Mode::Browsing;
+                return Action::MoveSession {
+                    display_idx: state.display_idx,
+                    target_project: target,
+                    target_cwd: cwd,
+                };
+            }
+            app.mode = Mode::Browsing;
+            Action::Continue
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            if let Some(state) = &mut app.move_state {
+                if state.selected + 1 < state.projects.len() {
+                    state.selected += 1;
+                }
+            }
+            Action::Continue
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            if let Some(state) = &mut app.move_state {
+                state.selected = state.selected.saturating_sub(1);
+            }
+            Action::Continue
+        }
+        KeyCode::Home => {
+            if let Some(state) = &mut app.move_state {
+                state.selected = 0;
+            }
+            Action::Continue
+        }
+        KeyCode::End => {
+            if let Some(state) = &mut app.move_state {
+                if !state.projects.is_empty() {
+                    state.selected = state.projects.len() - 1;
+                }
+            }
+            Action::Continue
+        }
+        _ => Action::Continue,
+    }
+}
+
+fn handle_title_edit(app: &mut App, key: KeyEvent) -> Action {
+    match key.code {
+        KeyCode::Esc => {
+            app.cancel_title_edit();
+            Action::Continue
+        }
+        KeyCode::Enter => {
+            match app.finish_title_edit() {
+                Ok(Some(action)) => action,
+                Ok(None) => Action::Continue,
+                Err(msg) => {
+                    app.set_status(msg);
+                    Action::Continue
+                }
+            }
+        }
+        KeyCode::Backspace => {
+            if let Some(state) = &mut app.title_edit {
+                if state.cursor > 0 {
+                    state.query.remove(state.cursor - 1);
+                    state.cursor -= 1;
+                }
+            }
+            Action::Continue
+        }
+        KeyCode::Left => {
+            if let Some(state) = &mut app.title_edit {
+                state.cursor = state.cursor.saturating_sub(1);
+            }
+            Action::Continue
+        }
+        KeyCode::Right => {
+            if let Some(state) = &mut app.title_edit {
+                if state.cursor < state.query.len() {
+                    state.cursor += 1;
+                }
+            }
+            Action::Continue
+        }
+        KeyCode::Char(c) => {
+            if let Some(state) = &mut app.title_edit {
+                state.query.insert(state.cursor, c);
+                state.cursor += 1;
+            }
+            Action::Continue
+        }
+        _ => Action::Continue,
+    }
+}
+
+fn handle_confirm_archive(app: &mut App, key: KeyEvent) -> Action {
+    match key.code {
+        KeyCode::Enter | KeyCode::Char('y') => {
+            let idx = app.archive_confirm.take();
+            app.mode = Mode::Browsing;
+            if let Some(display_idx) = idx {
+                return Action::ArchiveSession(display_idx);
+            }
+            Action::Continue
+        }
+        _ => {
+            app.archive_confirm = None;
+            app.mode = Mode::Browsing;
+            Action::Continue
+        }
     }
 }
 

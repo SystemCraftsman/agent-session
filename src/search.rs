@@ -21,9 +21,8 @@ pub fn build_session_index(claude_home: &Path, sessions: &[Session]) -> HashMap<
     let mut index = HashMap::with_capacity(sessions.len());
 
     for session in sessions {
-        let encoded_dir = session.project_path.replace('/', "-");
         let file_path = projects_dir
-            .join(&encoded_dir)
+            .join(&session.project_path)
             .join(format!("{}.jsonl", session.id));
         index.insert(file_path, session.clone());
     }
@@ -318,5 +317,6 @@ fn search_file_with_metadata(path: &Path, re: &Regex) -> Option<Session> {
         first_message,
         cwd,
         project_exists,
+        custom_title: None,
     })
 }

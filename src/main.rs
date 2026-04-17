@@ -4,6 +4,7 @@ mod filter;
 mod search;
 mod session;
 mod theme;
+mod titles;
 mod tui;
 
 use clap::Parser;
@@ -33,6 +34,10 @@ struct Cli {
     /// Force dark color theme
     #[arg(long = "dark", conflicts_with = "light")]
     dark: bool,
+
+    /// Start in flat list view (default: grouped by project)
+    #[arg(long = "flat")]
+    flat: bool,
 }
 
 /// Parse a human-friendly duration string into a chrono::Duration.
@@ -95,7 +100,8 @@ fn main() {
     };
 
     // Interactive TUI
-    if let Err(e) = tui::run(sessions, theme) {
+    let grouped_view = !cli.flat;
+    if let Err(e) = tui::run(sessions, theme, grouped_view) {
         eprintln!("TUI error: {e}");
         std::process::exit(1);
     }

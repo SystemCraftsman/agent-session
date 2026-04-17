@@ -15,6 +15,7 @@ pub struct Session {
     pub first_message: String,
     pub cwd: String,
     pub project_exists: bool,
+    pub custom_title: Option<String>,
 }
 
 impl Session {
@@ -22,9 +23,19 @@ impl Session {
     ///
     /// The path is single-quoted to handle spaces and special characters.
     pub fn resume_command(&self) -> String {
-        // Single-quote the path, escaping any embedded single quotes
         let escaped_cwd = self.cwd.replace('\'', "'\\''");
-        format!("cd '{}' && claude -r {}", escaped_cwd, self.id)
+        match &self.custom_title {
+            Some(title) => {
+                let escaped_title = title.replace('\'', "'\\''");
+                format!("cd '{}' && claude -r {} -n '{}'", escaped_cwd, self.id, escaped_title)
+            }
+            None => format!("cd '{}' && claude -r {}", escaped_cwd, self.id),
+        }
+    }
+
+    pub fn fork_command(&self) -> String {
+        let escaped_cwd = self.cwd.replace('\'', "'\\''");
+        format!("cd '{}' && claude -r {} --fork-session", escaped_cwd, self.id)
     }
 }
 

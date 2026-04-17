@@ -60,22 +60,60 @@ pub fn discover_sessions(claude_home: &Path) -> Vec<Session> {
     sessions
 }
 
+/// Decode a Claude project directory name to a real filesystem path.
+///
+/// Claude encodes paths by replacing '/' with '-', e.g.:
+///   `-Users-abulgu-github-repos-mabulgu-cluster-baremetal-operator`
+/// becomes:
+///   `/Users/abulgu/github-repos/mabulgu/cluster-baremetal-operator`
+///
+/// Uses filesystem probing to handle dashes in actual directory names.
+fn decode_encoded_dir(encoded: &str) -> String {
+    let trimmed = encoded.trim_start_matches('-');
+    let parts: Vec<&str> = trimmed.split('-').collect();
+    let mut path = PathBuf::from("/");
+    let mut i = 0;
+
+    while i < parts.len() {
+        let mut found = false;
+        for j in (i + 1..=parts.len()).rev() {
+            let candidate = parts[i..j].join("-");
+            let full = path.join(&candidate);
+            if full.is_dir() {
+                path = full;
+                i = j;
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            path = path.join(parts[i]);
+            i += 1;
+        }
+    }
+
+    path.to_string_lossy().to_string()
+}
+
 /// Parse a single JSONL session file and extract the first user message.
 fn parse_session_file(path: &Path) -> Option<Session> {
     let session_id = path.file_stem()?.to_str()?.to_string();
 
+    let encoded_dir = path.parent()?.file_name()?.to_str()?.to_string();
+
     let file = fs::File::open(path).ok()?;
     let reader = BufReader::new(file);
 
-    // Track metadata from the first user entry (for cwd, branch, timestamp)
-    // but keep scanning for a non-meta message to display
     let mut cwd = String::new();
     let mut git_branch: Option<String> = None;
     let mut timestamp: DateTime<Utc> = Utc::now();
     let mut first_message = String::new();
     let mut found_metadata = false;
+    let mut found_message = false;
+    let mut custom_title: Option<String> = None;
+    let mut line_count: usize = 0;
 
-    for line in reader.lines().take(50) {
+    for line in reader.lines() {
         let line = match line {
             Ok(l) => l,
             Err(_) => continue,
@@ -83,6 +121,27 @@ fn parse_session_file(path: &Path) -> Option<Session> {
         if line.trim().is_empty() {
             continue;
         }
+
+        if line.contains("\"custom-title\"") {
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&line) {
+                if val.get("type").and_then(|v| v.as_str()) == Some("custom-title") {
+                    custom_title = val
+                        .get("customTitle")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
+                }
+            }
+            continue;
+        }
+
+        if found_message {
+            continue;
+        }
+        line_count += 1;
+        if line_count > 50 {
+            continue;
+        }
+
         let entry: SessionFileEntry = match serde_json::from_str(&line) {
             Ok(e) => e,
             Err(_) => continue,
@@ -92,7 +151,6 @@ fn parse_session_file(path: &Path) -> Option<Session> {
             continue;
         }
 
-        // Grab metadata from the first user entry
         if !found_metadata {
             cwd = entry.cwd.clone().unwrap_or_default();
             git_branch = entry.git_branch.clone();
@@ -104,7 +162,6 @@ fn parse_session_file(path: &Path) -> Option<Session> {
             found_metadata = true;
         }
 
-        // Extract and clean message text
         let raw_text = entry.message.map(|m| m.content.text()).unwrap_or_default();
         if is_meta_message(&raw_text) {
             continue;
@@ -118,30 +175,43 @@ fn parse_session_file(path: &Path) -> Option<Session> {
             .chars()
             .take(200)
             .collect();
-        break;
+        found_message = true;
     }
 
     if !found_metadata {
         return None;
     }
 
-    let project_name = Path::new(&cwd)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("unknown")
-        .to_string();
+    let project_name = {
+        let decoded = decode_encoded_dir(&encoded_dir);
+        let decoded_path = Path::new(&decoded);
+        if decoded_path.exists() {
+            decoded_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("unknown")
+                .to_string()
+        } else {
+            Path::new(&cwd)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("unknown")
+                .to_string()
+        }
+    };
 
     let project_exists = Path::new(&cwd).exists();
 
     Some(Session {
         id: session_id,
-        project_path: cwd.clone(),
+        project_path: encoded_dir,
         project_name,
         git_branch,
         timestamp,
         first_message,
         cwd,
         project_exists,
+        custom_title,
     })
 }
 
@@ -152,10 +222,9 @@ fn parse_session_file(path: &Path) -> Option<Session> {
 /// the same role are merged into a single message with paragraphs separated by
 /// blank lines.
 pub fn load_conversation(claude_home: &Path, session: &Session) -> Vec<ConversationMessage> {
-    let encoded_dir = session.project_path.replace('/', "-");
     let file_path = claude_home
         .join("projects")
-        .join(&encoded_dir)
+        .join(&session.project_path)
         .join(format!("{}.jsonl", session.id));
 
     let file = match fs::File::open(&file_path) {
