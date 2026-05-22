@@ -515,10 +515,14 @@ impl App {
 
         match entry.source {
             DisplaySource::Sessions(sidx) => {
-                self.sessions.remove(sidx);
+                if sidx < self.sessions.len() && self.sessions[sidx].id == session.id {
+                    self.sessions.remove(sidx);
+                }
             }
             DisplaySource::Content(cidx) => {
-                self.content_results.remove(cidx);
+                if cidx < self.content_results.len() && self.content_results[cidx].id == session.id {
+                    self.content_results.remove(cidx);
+                }
             }
         }
         self.apply_filter();
@@ -581,7 +585,7 @@ impl App {
         let content = std::fs::read_to_string(&src)
             .map_err(|e| format!("failed to read session file: {e}"))?;
         let old_cwd = &session.cwd;
-        let updated: String = content
+        let mut updated: String = content
             .lines()
             .map(|line| {
                 if let Ok(mut val) = serde_json::from_str::<serde_json::Value>(line) {
@@ -597,11 +601,15 @@ impl App {
             })
             .collect::<Vec<_>>()
             .join("\n");
+        if !updated.is_empty() && !updated.ends_with('\n') {
+            updated.push('\n');
+        }
 
         let dst = dst_dir.join(format!("{}.jsonl", session.id));
         std::fs::write(&dst, &updated)
             .map_err(|e| format!("failed to write moved session: {e}"))?;
-        let _ = std::fs::remove_file(&src);
+        std::fs::remove_file(&src)
+            .map_err(|e| format!("failed to remove original session file: {e}"))?;
 
         let label = session.first_message.chars().take(40).collect::<String>();
         let target_name = std::path::Path::new(target_cwd)
@@ -611,10 +619,14 @@ impl App {
 
         match entry.source {
             DisplaySource::Sessions(sidx) => {
-                self.sessions.remove(sidx);
+                if sidx < self.sessions.len() && self.sessions[sidx].id == session.id {
+                    self.sessions.remove(sidx);
+                }
             }
             DisplaySource::Content(cidx) => {
-                self.content_results.remove(cidx);
+                if cidx < self.content_results.len() && self.content_results[cidx].id == session.id {
+                    self.content_results.remove(cidx);
+                }
             }
         }
         self.apply_filter();

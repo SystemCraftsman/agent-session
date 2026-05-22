@@ -154,19 +154,26 @@ fn handle_browse(app: &mut App, key: KeyEvent) -> Action {
                 if let Some(idx) = display_idx {
                     app.archive_confirm = Some(idx);
                     app.mode = Mode::ConfirmArchive;
-                    return Action::Continue;
                 }
+                return Action::Continue;
             }
-            if c == 'n' && !app.filter_active && app.grouped_view {
-                let cwd = match app.selected_tree_row().cloned() {
-                    Some(TreeRow::Project(gi)) => Some(app.project_groups[gi].cwd.clone()),
-                    Some(TreeRow::Session { project_idx, .. }) => Some(app.project_groups[project_idx].cwd.clone()),
-                    None => None,
+            if c == 'n' && !app.filter_active {
+                let cwd = if app.grouped_view {
+                    match app.selected_tree_row().cloned() {
+                        Some(TreeRow::Project(gi)) => Some(app.project_groups[gi].cwd.clone()),
+                        Some(TreeRow::Session { project_idx, .. }) => Some(app.project_groups[project_idx].cwd.clone()),
+                        None => None,
+                    }
+                } else if app.selected < app.display_entries.len() {
+                    let entry = &app.display_entries[app.selected];
+                    Some(app.display_session(entry).cwd.clone())
+                } else {
+                    None
                 };
                 if let Some(cwd) = cwd.filter(|c| !c.is_empty()) {
                     app.start_new_session_title(cwd);
-                    return Action::Continue;
                 }
+                return Action::Continue;
             }
             if c == 't' && !app.filter_active {
                 let display_idx = if app.grouped_view {
