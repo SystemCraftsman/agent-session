@@ -187,6 +187,7 @@ pub struct MoveState {
 pub enum TitleEditContext {
     Rename { session_id: String },
     NewSession { cwd: String },
+    Fork { session_id: String, cwd: String },
 }
 
 /// State for title editing.
@@ -660,6 +661,24 @@ impl App {
         self.mode = Mode::TitleEdit;
     }
 
+    /// Start title input for forking a session.
+    pub fn start_fork_title(&mut self, session_id: String, cwd: String) {
+        let existing = self.find_session(&session_id)
+            .and_then(|s| s.custom_title.clone());
+        let prefill = match existing {
+            Some(title) => format!("{} (fork)", title),
+            None => String::new(),
+        };
+        let cursor = prefill.len();
+        self.title_edit = Some(TitleEditState {
+            context: TitleEditContext::Fork { session_id, cwd },
+            query: prefill,
+            cursor,
+            return_mode: Mode::Conversation,
+        });
+        self.mode = Mode::TitleEdit;
+    }
+
     /// Finish title editing. Returns an Action if the caller should execute it.
     pub fn finish_title_edit(&mut self) -> Result<Option<Action>, String> {
         let state = self.title_edit.take().ok_or("no title edit in progress")?;
@@ -719,6 +738,20 @@ impl App {
                 let escaped_title = title.replace('\'', "'\\''");
                 self.mode = Mode::Browsing;
                 Ok(Some(Action::NewSession(format!("cd '{}' && claude -n '{}'", escaped_cwd, escaped_title))))
+            }
+            TitleEditContext::Fork { session_id, cwd } => {
+                let escaped_cwd = cwd.replace('\'', "'\\''");
+                if title.is_empty() {
+                    self.mode = state.return_mode;
+                    return Ok(Some(Action::ForkSession(
+                        format!("cd '{}' && claude -r {} --fork-session", escaped_cwd, session_id)
+                    )));
+                }
+                let escaped_title = title.replace('\'', "'\\''");
+                self.mode = state.return_mode;
+                Ok(Some(Action::ForkSession(
+                    format!("cd '{}' && claude -r {} --fork-session -n '{}'", escaped_cwd, session_id, escaped_title)
+                )))
             }
         }
     }
