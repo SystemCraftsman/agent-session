@@ -359,6 +359,7 @@ impl App {
 
     /// Rebuild project groups and tree rows from current display entries.
     pub fn rebuild_tree_rows(&mut self) {
+        let has_filter = !self.filter_query.is_empty();
         let old_expanded: HashMap<String, bool> = self.project_groups
             .iter()
             .map(|g| (g.path.clone(), g.expanded))
@@ -369,7 +370,9 @@ impl App {
             &self.content_results,
         );
         for group in &mut self.project_groups {
-            if let Some(&was_expanded) = old_expanded.get(&group.path) {
+            if has_filter {
+                group.expanded = true;
+            } else if let Some(&was_expanded) = old_expanded.get(&group.path) {
                 group.expanded = was_expanded;
             }
         }

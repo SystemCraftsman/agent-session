@@ -1,4 +1,3 @@
-mod clipboard;
 mod discovery;
 mod filter;
 mod search;

@@ -72,9 +72,10 @@ pub fn filter_sessions(sessions: &[Session], query: &str) -> Vec<usize> {
         .enumerate()
         .filter_map(|(idx, session)| {
             let branch = session.git_branch.as_deref().unwrap_or("");
+            let title = session.custom_title.as_deref().unwrap_or("");
             let haystack = format!(
-                "{} {} {}",
-                session.project_name, branch, session.first_message
+                "{} {} {} {}",
+                session.project_name, branch, session.first_message, title
             )
             .to_lowercase();
 
