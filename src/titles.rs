@@ -22,10 +22,19 @@ fn append_custom_title(path: &Path, session_id: &str, title: &str) -> Result<(),
         "sessionId": session_id,
     });
 
+    let needs_newline = std::fs::read(path)
+        .map(|bytes| !bytes.is_empty() && !bytes.ends_with(b"\n"))
+        .unwrap_or(false);
+
     let mut file = OpenOptions::new()
         .append(true)
         .open(path)
         .map_err(|e| format!("failed to open session file: {e}"))?;
+
+    if needs_newline {
+        file.write_all(b"\n")
+            .map_err(|e| format!("failed to write newline: {e}"))?;
+    }
 
     writeln!(file, "{}", entry)
         .map_err(|e| format!("failed to write title: {e}"))

@@ -64,7 +64,7 @@ fn render_flat_session_list(frame: &mut Frame, app: &App, area: Rect) {
         let delta = Utc::now().signed_duration_since(session.timestamp);
         let time_ago = HumanTime::from(-delta).to_text_en(Accuracy::Rough, Tense::Past);
         let right = format!("{}  {}", session.project_name, time_ago);
-        let right_len = right.len();
+        let right_len = right.chars().count();
 
         let (cursor, cursor_len) = if is_selected {
             ("\u{27A4} ", 2)
@@ -189,7 +189,7 @@ fn render_grouped_session_list(frame: &mut Frame, app: &App, area: Rect) {
                 let delta = Utc::now().signed_duration_since(session.timestamp);
                 let time_ago = HumanTime::from(-delta).to_text_en(Accuracy::Rough, Tense::Past);
                 let right = format!("  {}", time_ago);
-                let right_len = right.len();
+                let right_len = right.chars().count();
 
                 let indent = "    ";
                 let indent_len = 4;
@@ -921,8 +921,11 @@ fn render_title_edit_bar(app: &App) -> Line<'static> {
 
     if let Some(state) = &app.title_edit {
         let is_new = matches!(state.context, super::TitleEditContext::NewSession { .. });
-        let label = if is_new { " New session: " } else { " Title: " };
-        let hint = if is_new {
+        let is_fork = matches!(state.context, super::TitleEditContext::Fork { .. });
+        let label = if is_fork { " Fork title: " } else if is_new { " New session: " } else { " Title: " };
+        let hint = if is_fork {
+            "Enter fork  Esc cancel  (empty = no name)"
+        } else if is_new {
             "Enter create  Esc cancel  (empty = no name)"
         } else {
             "Enter save  Esc cancel  (clear to remove title)"

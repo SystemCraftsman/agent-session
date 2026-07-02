@@ -312,11 +312,11 @@ fn handle_conversation(app: &mut App, key: KeyEvent) -> Action {
         }
         KeyCode::Char('f') => {
             if let Some(conv) = &app.conversation {
-                let cmd = conv.session.fork_command();
-                Action::ForkSession(cmd)
-            } else {
-                Action::Continue
+                let session_id = conv.session.id.clone();
+                let cwd = conv.session.cwd.clone();
+                app.start_fork_title(session_id, cwd);
             }
+            Action::Continue
         }
         KeyCode::Char('/') => {
             if let Some(conv) = &mut app.conversation {
@@ -387,8 +387,13 @@ fn handle_conversation_search(app: &mut App, key: KeyEvent) -> Action {
                     conv.search_cursor = 0;
                     conv.search_replacing = false;
                 } else if conv.search_cursor > 0 {
-                    conv.search_query.remove(conv.search_cursor - 1);
-                    conv.search_cursor -= 1;
+                    let prev = conv.search_query[..conv.search_cursor]
+                        .char_indices()
+                        .next_back()
+                        .map(|(i, _)| i)
+                        .unwrap_or(0);
+                    conv.search_query.remove(prev);
+                    conv.search_cursor = prev;
                 }
                 conv.rendered_width = 0;
             }
@@ -400,7 +405,11 @@ fn handle_conversation_search(app: &mut App, key: KeyEvent) -> Action {
                     conv.search_replacing = false;
                     conv.search_cursor = 0;
                 } else if conv.search_cursor > 0 {
-                    conv.search_cursor -= 1;
+                    conv.search_cursor = conv.search_query[..conv.search_cursor]
+                        .char_indices()
+                        .next_back()
+                        .map(|(i, _)| i)
+                        .unwrap_or(0);
                 }
             }
             Action::Continue
@@ -411,7 +420,11 @@ fn handle_conversation_search(app: &mut App, key: KeyEvent) -> Action {
                     conv.search_replacing = false;
                     conv.search_cursor = conv.search_query.len();
                 } else if conv.search_cursor < conv.search_query.len() {
-                    conv.search_cursor += 1;
+                    conv.search_cursor = conv.search_query[conv.search_cursor..]
+                        .char_indices()
+                        .nth(1)
+                        .map(|(i, _)| conv.search_cursor + i)
+                        .unwrap_or(conv.search_query.len());
                 }
             }
             Action::Continue
@@ -424,7 +437,7 @@ fn handle_conversation_search(app: &mut App, key: KeyEvent) -> Action {
                     conv.search_replacing = false;
                 }
                 conv.search_query.insert(conv.search_cursor, c);
-                conv.search_cursor += 1;
+                conv.search_cursor += c.len_utf8();
                 conv.rendered_width = 0;
             }
             Action::Continue
@@ -506,22 +519,38 @@ fn handle_title_edit(app: &mut App, key: KeyEvent) -> Action {
         KeyCode::Backspace => {
             if let Some(state) = &mut app.title_edit {
                 if state.cursor > 0 {
-                    state.query.remove(state.cursor - 1);
-                    state.cursor -= 1;
+                    let prev = state.query[..state.cursor]
+                        .char_indices()
+                        .next_back()
+                        .map(|(i, _)| i)
+                        .unwrap_or(0);
+                    state.query.remove(prev);
+                    state.cursor = prev;
                 }
             }
             Action::Continue
         }
         KeyCode::Left => {
             if let Some(state) = &mut app.title_edit {
-                state.cursor = state.cursor.saturating_sub(1);
+                if state.cursor > 0 {
+                    state.cursor = state.query[..state.cursor]
+                        .char_indices()
+                        .next_back()
+                        .map(|(i, _)| i)
+                        .unwrap_or(0);
+                }
             }
             Action::Continue
         }
         KeyCode::Right => {
             if let Some(state) = &mut app.title_edit {
                 if state.cursor < state.query.len() {
-                    state.cursor += 1;
+                    let next = state.query[state.cursor..]
+                        .char_indices()
+                        .nth(1)
+                        .map(|(i, _)| state.cursor + i)
+                        .unwrap_or(state.query.len());
+                    state.cursor = next;
                 }
             }
             Action::Continue
@@ -529,7 +558,7 @@ fn handle_title_edit(app: &mut App, key: KeyEvent) -> Action {
         KeyCode::Char(c) => {
             if let Some(state) = &mut app.title_edit {
                 state.query.insert(state.cursor, c);
-                state.cursor += 1;
+                state.cursor += c.len_utf8();
             }
             Action::Continue
         }

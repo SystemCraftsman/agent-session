@@ -310,7 +310,7 @@ fn search_file_with_metadata(path: &Path, re: &Regex) -> Option<Session> {
 
     Some(Session {
         id: session_id,
-        project_path: cwd.clone(),
+        project_path: path.parent()?.file_name()?.to_str()?.to_string(),
         project_name,
         git_branch: entry.git_branch,
         timestamp,

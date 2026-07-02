@@ -25,18 +25,14 @@ impl Session {
     pub fn resume_command(&self) -> String {
         let escaped_cwd = self.cwd.replace('\'', "'\\''");
         match &self.custom_title {
-            Some(title) => {
+            Some(title) if !title.is_empty() => {
                 let escaped_title = title.replace('\'', "'\\''");
                 format!("cd '{}' && claude -r {} -n '{}'", escaped_cwd, self.id, escaped_title)
             }
-            None => format!("cd '{}' && claude -r {}", escaped_cwd, self.id),
+            _ => format!("cd '{}' && claude -r {}", escaped_cwd, self.id),
         }
     }
 
-    pub fn fork_command(&self) -> String {
-        let escaped_cwd = self.cwd.replace('\'', "'\\''");
-        format!("cd '{}' && claude -r {} --fork-session", escaped_cwd, self.id)
-    }
 }
 
 /// A single line from a session JSONL file.
