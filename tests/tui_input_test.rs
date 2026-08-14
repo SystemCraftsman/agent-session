@@ -3,6 +3,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use serial_test::serial;
 
 use cc_session::discovery::discover_sessions;
 use cc_session::theme::Theme;
@@ -32,6 +33,10 @@ fn make_app_expanded() -> App {
 
 fn key(code: KeyCode) -> KeyEvent {
     KeyEvent::new(code, KeyModifiers::NONE)
+}
+
+fn key_ctrl(c: char) -> KeyEvent {
+    KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
 }
 
 #[test]
@@ -190,7 +195,7 @@ fn a_key_sets_archive_confirm() {
     app.selected = 0;
     assert!(app.archive_confirm.is_none());
 
-    let action = handle_input(&mut app, key(KeyCode::Char('a')));
+    let action = handle_input(&mut app, key_ctrl('a'));
     assert!(matches!(action, Action::Continue));
     assert_eq!(app.archive_confirm, Some(0));
 }
@@ -201,7 +206,7 @@ fn a_key_in_grouped_view_on_session_sets_confirm() {
     app.selected = 1;
     assert!(matches!(app.tree_rows[1], TreeRow::Session { .. }));
 
-    let action = handle_input(&mut app, key(KeyCode::Char('a')));
+    let action = handle_input(&mut app, key_ctrl('a'));
     assert!(matches!(action, Action::Continue));
     assert!(app.archive_confirm.is_some());
 }
@@ -212,7 +217,7 @@ fn a_key_in_grouped_view_on_project_is_noop() {
     app.selected = 0;
     assert!(matches!(app.tree_rows[0], TreeRow::Project(_)));
 
-    let action = handle_input(&mut app, key(KeyCode::Char('a')));
+    let action = handle_input(&mut app, key_ctrl('a'));
     assert!(matches!(action, Action::Continue));
     assert!(app.archive_confirm.is_none());
 }
@@ -265,6 +270,36 @@ fn a_key_ignored_when_filter_active() {
 }
 
 #[test]
+fn ctrl_a_archives_even_when_filter_active() {
+    let mut app = make_app(false);
+    app.filter_active = true;
+    app.selected = 0;
+
+    let action = handle_input(&mut app, key_ctrl('a'));
+    assert!(matches!(action, Action::Continue));
+    assert_eq!(
+        app.archive_confirm,
+        Some(0),
+        "Ctrl shortcuts must work while filtering"
+    );
+}
+
+#[test]
+fn ctrl_v_moves_even_when_filter_active() {
+    let mut app = make_app(false);
+    app.filter_active = true;
+    app.selected = 0;
+
+    let action = handle_input(&mut app, key_ctrl('v'));
+    assert!(matches!(action, Action::Continue));
+    assert!(
+        app.move_state.is_some(),
+        "Ctrl shortcuts must work while filtering"
+    );
+}
+
+#[test]
+#[serial]
 fn archive_session_moves_file() {
     let tmp = tempfile::tempdir().unwrap();
     let project_dir = tmp.path().join("projects").join("-Users-test-myproject");
@@ -301,11 +336,11 @@ fn archive_session_moves_file() {
 }
 
 #[test]
-fn m_key_on_session_starts_move() {
+fn ctrl_v_on_session_starts_move() {
     let mut app = make_app(false);
     app.selected = 0;
 
-    let action = handle_input(&mut app, key(KeyCode::Char('m')));
+    let action = handle_input(&mut app, key_ctrl('v'));
     assert!(matches!(action, Action::Continue));
     assert!(matches!(app.mode, Mode::MoveSelectProject));
     assert!(app.move_state.is_some());
@@ -323,12 +358,12 @@ fn m_key_ignored_when_filter_active() {
 }
 
 #[test]
-fn m_key_in_grouped_view_on_project_is_noop() {
+fn ctrl_v_in_grouped_view_on_project_is_noop() {
     let mut app = make_app(true);
     app.selected = 0;
     assert!(matches!(app.tree_rows[0], TreeRow::Project(_)));
 
-    let action = handle_input(&mut app, key(KeyCode::Char('m')));
+    let action = handle_input(&mut app, key_ctrl('v'));
     assert!(matches!(action, Action::Continue));
     assert!(app.move_state.is_none());
 }
@@ -337,7 +372,7 @@ fn m_key_in_grouped_view_on_project_is_noop() {
 fn move_picker_esc_cancels() {
     let mut app = make_app(false);
     app.selected = 0;
-    handle_input(&mut app, key(KeyCode::Char('m')));
+    handle_input(&mut app, key_ctrl('v'));
     assert!(matches!(app.mode, Mode::MoveSelectProject));
 
     let action = handle_input(&mut app, key(KeyCode::Esc));
@@ -350,7 +385,7 @@ fn move_picker_esc_cancels() {
 fn move_picker_navigation() {
     let mut app = make_app(false);
     app.selected = 0;
-    handle_input(&mut app, key(KeyCode::Char('m')));
+    handle_input(&mut app, key_ctrl('v'));
 
     let project_count = app.move_state.as_ref().unwrap().projects.len();
     if project_count > 1 {
@@ -366,7 +401,7 @@ fn move_picker_navigation() {
 fn move_picker_enter_triggers_move() {
     let mut app = make_app(false);
     app.selected = 0;
-    handle_input(&mut app, key(KeyCode::Char('m')));
+    handle_input(&mut app, key_ctrl('v'));
 
     if app.move_state.is_some() {
         let action = handle_input(&mut app, key(KeyCode::Enter));
@@ -376,6 +411,7 @@ fn move_picker_enter_triggers_move() {
 }
 
 #[test]
+#[serial]
 fn move_session_moves_file() {
     let tmp = tempfile::tempdir().unwrap();
     let src_dir = tmp.path().join("projects").join("-Users-test-src-project");

@@ -5,6 +5,44 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use super::{Action, App, ContentSearchState, Mode, TreeRow};
 
+/// Resolve the display index of the currently selected session, if any.
+///
+/// In grouped view this is only defined when a session row (not a project
+/// header) is selected; in flat view it is the current selection.
+fn current_selection_idx(app: &App) -> Option<usize> {
+    if app.grouped_view {
+        match app.selected_tree_row().cloned() {
+            Some(TreeRow::Session { display_idx, .. }) => Some(display_idx),
+            _ => None,
+        }
+    } else if app.selected < app.display_entries.len() {
+        Some(app.selected)
+    } else {
+        None
+    }
+}
+
+/// Resolve the working directory for the current selection.
+///
+/// Unlike [`current_selection_idx`], a project header also resolves (to that
+/// project's cwd) so a new session can be started from a group header.
+fn current_selection_cwd(app: &App) -> Option<String> {
+    if app.grouped_view {
+        match app.selected_tree_row().cloned() {
+            Some(TreeRow::Project(gi)) => Some(app.project_groups[gi].cwd.clone()),
+            Some(TreeRow::Session { project_idx, .. }) => {
+                Some(app.project_groups[project_idx].cwd.clone())
+            }
+            None => None,
+        }
+    } else if app.selected < app.display_entries.len() {
+        let entry = &app.display_entries[app.selected];
+        Some(app.display_session(entry).cwd.clone())
+    } else {
+        None
+    }
+}
+
 /// Handle a key event and return the resulting action.
 pub fn handle_input(app: &mut App, key: KeyEvent) -> Action {
     // Ctrl-C always quits
@@ -136,79 +174,51 @@ fn handle_browse(app: &mut App, key: KeyEvent) -> Action {
             Action::Continue
         }
         KeyCode::Char(c) => {
-            if c == '/' && app.filter_query.is_empty() && !app.filter_active {
+            let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+
+            // `/` enters filter mode explicitly (kept for discoverability).
+            if !ctrl && c == '/' && app.filter_query.is_empty() && !app.filter_active {
                 app.filter_active = true;
                 return Action::Continue;
             }
-            if c == 'a' && !app.filter_active {
-                let display_idx = if app.grouped_view {
-                    match app.selected_tree_row().cloned() {
-                        Some(TreeRow::Session { display_idx, .. }) => Some(display_idx),
-                        _ => None,
-                    }
-                } else if app.selected < app.display_entries.len() {
-                    Some(app.selected)
-                } else {
-                    None
-                };
-                if let Some(idx) = display_idx {
+
+            // Action shortcuts use Ctrl so that bare typing always feeds the
+            // search filter (cc-session's "just start typing" model). Ctrl
+            // shortcuts work whether or not the filter is currently active.
+            // Move is Ctrl-v because Ctrl-m is indistinguishable from Enter.
+            if ctrl && c == 'a' {
+                if let Some(idx) = current_selection_idx(app) {
                     app.archive_confirm = Some(idx);
                     app.mode = Mode::ConfirmArchive;
                 }
                 return Action::Continue;
             }
-            if c == 'n' && !app.filter_active {
-                let cwd = if app.grouped_view {
-                    match app.selected_tree_row().cloned() {
-                        Some(TreeRow::Project(gi)) => Some(app.project_groups[gi].cwd.clone()),
-                        Some(TreeRow::Session { project_idx, .. }) => Some(app.project_groups[project_idx].cwd.clone()),
-                        None => None,
-                    }
-                } else if app.selected < app.display_entries.len() {
-                    let entry = &app.display_entries[app.selected];
-                    Some(app.display_session(entry).cwd.clone())
-                } else {
-                    None
-                };
-                if let Some(cwd) = cwd.filter(|c| !c.is_empty()) {
+            if ctrl && c == 'n' {
+                if let Some(cwd) = current_selection_cwd(app).filter(|c| !c.is_empty()) {
                     app.start_new_session_title(cwd);
                 }
                 return Action::Continue;
             }
-            if c == 't' && !app.filter_active {
-                let display_idx = if app.grouped_view {
-                    match app.selected_tree_row().cloned() {
-                        Some(TreeRow::Session { display_idx, .. }) => Some(display_idx),
-                        _ => None,
-                    }
-                } else if app.selected < app.display_entries.len() {
-                    Some(app.selected)
-                } else {
-                    None
-                };
-                if let Some(idx) = display_idx {
+            if ctrl && c == 't' {
+                if let Some(idx) = current_selection_idx(app) {
                     let entry = &app.display_entries[idx];
                     let session_id = app.display_session(entry).id.clone();
                     app.start_title_edit(session_id, Mode::Browsing);
-                    return Action::Continue;
                 }
+                return Action::Continue;
             }
-            if c == 'm' && !app.filter_active {
-                let display_idx = if app.grouped_view {
-                    match app.selected_tree_row().cloned() {
-                        Some(TreeRow::Session { display_idx, .. }) => Some(display_idx),
-                        _ => None,
-                    }
-                } else if app.selected < app.display_entries.len() {
-                    Some(app.selected)
-                } else {
-                    None
-                };
-                if let Some(idx) = display_idx {
+            if ctrl && c == 'v' {
+                if let Some(idx) = current_selection_idx(app) {
                     app.start_move(idx);
-                    return Action::Continue;
                 }
+                return Action::Continue;
             }
+
+            // Ignore any other Ctrl-modified key so it never pollutes the filter.
+            if ctrl {
+                return Action::Continue;
+            }
+
             app.filter_active = true;
             app.filter_query.push(c);
             app.cancel_flag.store(true, Ordering::Relaxed);
