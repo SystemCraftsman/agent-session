@@ -1039,7 +1039,23 @@ fn render_status_bar(frame: &mut Frame, app: &App, area: Rect) {
                 } else {
                     "Tab grouped view"
                 };
-                Line::from(vec![
+                let mut spans: Vec<Span> = Vec::new();
+                // Optional local-router indicators. Hidden entirely when no
+                // router setup is present (see App::router_enabled / profile_label).
+                if let Some(profile) = &app.profile_label {
+                    spans.push(Span::styled(" profile: ", dim));
+                    spans.push(Span::styled(profile.clone(), Style::default().fg(app.theme.text)));
+                    spans.push(Span::raw("  "));
+                }
+                if let Some(on) = app.router_enabled {
+                    spans.push(Span::styled("router: ", dim));
+                    spans.push(Span::styled(
+                        if on { "on" } else { "off" },
+                        Style::default().fg(if on { Color::Green } else { Color::Yellow }),
+                    ));
+                    spans.push(Span::styled("  |  ", dim));
+                }
+                spans.extend([
                     Span::styled(" Enter ", dim),
                     Span::styled("detail", dim),
                     Span::raw("  "),
@@ -1061,7 +1077,8 @@ fn render_status_bar(frame: &mut Frame, app: &App, area: Rect) {
                     Span::styled(view_hint, dim),
                     Span::raw("  "),
                     Span::styled("(type to search)", dim),
-                ])
+                ]);
+                Line::from(spans)
             }
         }
     };

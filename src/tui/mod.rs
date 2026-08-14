@@ -261,6 +261,11 @@ pub struct App {
     pub move_state: Option<MoveState>,
     /// Title being edited.
     pub title_edit: Option<TitleEditState>,
+    /// Cached auto-router state from `~/.claude-router`; `None` when no router
+    /// setup is present, in which case the indicator and `^r` toggle are hidden.
+    pub router_enabled: Option<bool>,
+    /// Cached default profile label from `~/.claude-default-profile`.
+    pub profile_label: Option<String>,
 }
 
 impl App {
@@ -302,6 +307,8 @@ impl App {
             archive_confirm: None,
             move_state: None,
             title_edit: None,
+            router_enabled: crate::router::router_state(),
+            profile_label: crate::router::profile_name(),
         }
     }
 

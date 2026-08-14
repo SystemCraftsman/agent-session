@@ -1,5 +1,6 @@
 mod discovery;
 mod filter;
+mod router;
 mod search;
 mod session;
 mod theme;
