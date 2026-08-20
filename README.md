@@ -2,8 +2,6 @@
 
 A fast terminal UI for browsing, searching, replaying, forking, and transferring your AI coding sessions across **Claude Code**, **Codex CLI**, and **Cursor CLI**, all from one place.
 
-![Agent Sessions demo](docs/demo.gif)
-
 ## Overview
 
 Every coding agent stores its own conversation history in its own format and its own directory. Agent Sessions reads all of them, merges the sessions into a single searchable list, and lets you jump back into any of them with one keypress. It also lets you carry a conversation from one agent into another, so work you started in Claude can continue in Codex or Cursor.
