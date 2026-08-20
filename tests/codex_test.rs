@@ -1,10 +1,10 @@
 use std::path::{Path, PathBuf};
 
-use cc_session::codex::{
+use agent_session::codex::{
     archive_codex_session, discover_codex_sessions, load_codex_conversation, load_codex_titles,
     move_codex_session, save_codex_title,
 };
-use cc_session::session::{Agent, MessageRole};
+use agent_session::session::{Agent, MessageRole};
 
 fn codex_home() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/codex")
@@ -71,7 +71,7 @@ fn resume_command_uses_codex_shell_wrapper() {
         .iter()
         .find(|s| s.id == "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
         .expect("session aaaa present");
-    // cc-session emits a bare `codex`; the user's `codex()` shell function owns
+    // Agent Sessions emits a bare `codex`; the user's `codex()` shell function owns
     // any wrapping (mirroring the `claude` wrapper).
     assert_eq!(
         s.resume_command(),

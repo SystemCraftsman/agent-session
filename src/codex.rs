@@ -61,21 +61,31 @@ pub fn discover_codex_sessions(codex_home: &Path) -> Vec<Session> {
     sessions
 }
 
-/// Path to the cc-session title sidecar for Codex sessions.
+/// Path to the title sidecar for Codex sessions.
 ///
 /// Codex rollout files must stay faithful for `codex resume`, so custom titles
-/// live in a sidecar map (`<codex_home>/cc-session-titles.json`) keyed by
+/// live in a sidecar map (`<codex_home>/agent-session-titles.json`) keyed by
 /// session id rather than being written into the rollout itself.
 fn codex_titles_path(codex_home: &Path) -> PathBuf {
+    codex_home.join("agent-session-titles.json")
+}
+
+/// Legacy sidecar path from the tool's former `cc-session` name. Read as a
+/// fallback so titles saved before the rename are not lost.
+fn legacy_codex_titles_path(codex_home: &Path) -> PathBuf {
     codex_home.join("cc-session-titles.json")
 }
 
 /// Load the id -> custom title map for Codex sessions. A missing or corrupt file
-/// yields an empty map.
+/// yields an empty map; the legacy `cc-session-titles.json` is read as a
+/// fallback when the current sidecar is absent.
 pub fn load_codex_titles(codex_home: &Path) -> HashMap<String, String> {
-    match fs::read_to_string(codex_titles_path(codex_home)) {
-        Ok(data) => serde_json::from_str(&data).unwrap_or_default(),
-        Err(_) => HashMap::new(),
+    let read = |p: PathBuf| fs::read_to_string(p).ok();
+    match read(codex_titles_path(codex_home))
+        .or_else(|| read(legacy_codex_titles_path(codex_home)))
+    {
+        Some(data) => serde_json::from_str(&data).unwrap_or_default(),
+        None => HashMap::new(),
     }
 }
 

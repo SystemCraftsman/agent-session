@@ -14,10 +14,11 @@ use clap::Parser;
 
 use discovery::{apply_filters, discover_sessions, get_claude_home};
 
-/// Fast CLI tool for finding and resuming Claude Code sessions.
+/// Fast TUI for browsing, forking, and transferring AI coding sessions
+/// across Claude, Codex, and Cursor.
 #[derive(Parser, Debug)]
 #[command(
-    name = "cc-session",
+    name = "agent-session",
     version = concat!(env!("CARGO_PKG_VERSION"), " (", env!("BUILD_GIT_HASH"), " ", env!("BUILD_DATE"), ")"),
     about
 )]

@@ -1,15 +1,15 @@
 [package]
-name = "cc-session"
+name = "agent-session"
 version = "0.7.5"
 edition = "2021"
 rust-version = "1.80.0"
-description = "Fast CLI tool for finding and resuming Claude Code sessions"
+description = "Fast TUI for browsing, forking, and transferring AI coding sessions across Claude, Codex, and Cursor"
 license = "MIT"
-repository = "https://github.com/cc-deck/cc-session"
+repository = "https://github.com/SystemCraftsman/agent-session"
 readme = "README.md"
-keywords = ["claude", "cli", "tui", "session"]
+keywords = ["claude", "codex", "cursor", "cli", "tui"]
 categories = ["command-line-utilities"]
-homepage = "https://github.com/cc-deck/cc-session"
+homepage = "https://github.com/SystemCraftsman/agent-session"
 
 [dependencies]
 ratatui = "0.30"

@@ -126,7 +126,7 @@ fn render_flat_session_list(frame: &mut Frame, app: &App, area: Rect) {
         .borders(Borders::ALL)
         .border_style(border_style)
         .title(format!(
-            " cc-session ({}/{}) ",
+            " Agent Sessions ({}/{}) ",
             app.display_entries.len(),
             app.sessions.len()
         ))
@@ -270,7 +270,7 @@ fn render_grouped_session_list(frame: &mut Frame, app: &App, area: Rect) {
         .borders(Borders::ALL)
         .border_style(border_style)
         .title(format!(
-            " cc-session ({}/{}) \u{2500} {} projects ",
+            " Agent Sessions ({}/{}) \u{2500} {} projects ",
             session_count,
             app.sessions.len(),
             app.project_groups.len(),
@@ -472,7 +472,7 @@ fn render_conversation(frame: &mut Frame, app: &mut App, area: Rect) {
     };
 
     let title_text = if session_title.is_empty() {
-        format!(" cc-session{search_info} ")
+        format!(" Agent Sessions{search_info} ")
     } else {
         format!(" {session_title}{search_info} ")
     };

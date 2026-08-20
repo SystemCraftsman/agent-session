@@ -2,7 +2,7 @@
 //! (`~/.claude-default-profile`).
 //!
 //! This file is owned by the user's shell launcher (the `claude()` function
-//! in the shell profile). cc-session only *reflects* the active claude profile
+//! in the shell profile). Agent Sessions only *reflects* the active claude profile
 //! in the status bar. Returns `None` when the file is absent, so the indicator
 //! stays invisible for anyone without that setup.
 

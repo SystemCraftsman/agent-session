@@ -5,9 +5,9 @@ use std::path::PathBuf;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use serial_test::serial;
 
-use cc_session::discovery::discover_sessions;
-use cc_session::theme::Theme;
-use cc_session::tui::{input::handle_input, Action, App, Mode, TreeRow};
+use agent_session::discovery::discover_sessions;
+use agent_session::theme::Theme;
+use agent_session::tui::{input::handle_input, Action, App, Mode, TreeRow};
 
 fn fixture_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")

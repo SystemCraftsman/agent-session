@@ -1,5 +1,5 @@
-use cc_session::discovery::discover_sessions;
-use cc_session::filter::{filter_sessions, parse_keywords};
+use agent_session::discovery::discover_sessions;
+use agent_session::filter::{filter_sessions, parse_keywords};
 use std::path::PathBuf;
 
 fn fixture_dir() -> PathBuf {

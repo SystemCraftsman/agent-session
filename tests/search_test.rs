@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use cc_session::search::deep_search;
+use agent_session::search::deep_search;
 
 fn fixture_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")

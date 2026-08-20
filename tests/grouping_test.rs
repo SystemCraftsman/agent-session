@@ -1,8 +1,8 @@
 use std::path::PathBuf;
 
-use cc_session::discovery::discover_sessions;
-use cc_session::filter::filter_sessions;
-use cc_session::tui::{
+use agent_session::discovery::discover_sessions;
+use agent_session::filter::filter_sessions;
+use agent_session::tui::{
     build_tree_rows, group_by_project, DisplayEntry, DisplaySource, MatchType, TreeRow,
 };
 
@@ -10,7 +10,7 @@ fn fixture_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
 }
 
-fn make_display_entries(sessions: &[cc_session::session::Session]) -> Vec<DisplayEntry> {
+fn make_display_entries(sessions: &[agent_session::session::Session]) -> Vec<DisplayEntry> {
     sessions
         .iter()
         .enumerate()
@@ -57,7 +57,7 @@ fn group_by_project_correct_session_counts() {
 
 #[test]
 fn claude_and_codex_in_same_dir_merge_into_one_group() {
-    use cc_session::session::{Agent, Session};
+    use agent_session::session::{Agent, Session};
     use chrono::Utc;
 
     let cwd = "/Users/test/shared-project";

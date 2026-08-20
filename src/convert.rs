@@ -351,7 +351,7 @@ fn seed_cursor_session(
         doc.push_str(&format!("## {who}\n\n{}\n\n", m.text));
     }
 
-    let import_dir = cursor_home.join("cc-session-imports");
+    let import_dir = cursor_home.join("agent-session-imports");
     fs::create_dir_all(&import_dir)
         .map_err(|e| format!("failed to create cursor import dir: {e}"))?;
     let import_path = import_dir.join(format!("{new_id}.md"));
@@ -473,8 +473,8 @@ fn generate_uuid(seed: &str) -> String {
         salt.hash(&mut h);
         h.finish()
     };
-    let hi = hash_with("cc-session-hi").to_be_bytes();
-    let lo = hash_with("cc-session-lo").to_be_bytes();
+    let hi = hash_with("agent-session-hi").to_be_bytes();
+    let lo = hash_with("agent-session-lo").to_be_bytes();
 
     let mut b = [0u8; 16];
     b[..8].copy_from_slice(&hi);

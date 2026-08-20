@@ -1,4 +1,4 @@
-use cc_session::session::{SessionFileEntry, StringOrArray};
+use agent_session::session::{SessionFileEntry, StringOrArray};
 
 #[test]
 fn parse_user_entry_with_string_content() {

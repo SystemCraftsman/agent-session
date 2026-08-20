@@ -1,15 +1,15 @@
 use std::path::Path;
 
-use cc_session::convert::clone_to_other_agent;
-use cc_session::cursor::{discover_cursor_sessions, encode_cursor_dir, load_cursor_conversation};
-use cc_session::discovery::load_conversation;
-use cc_session::session::{Agent, MessageRole, Session};
+use agent_session::convert::clone_to_other_agent;
+use agent_session::cursor::{discover_cursor_sessions, encode_cursor_dir, load_cursor_conversation};
+use agent_session::discovery::load_conversation;
+use agent_session::session::{Agent, MessageRole, Session};
 
 use serial_test::serial;
 
 /// A real, existing cwd whose `/tmp/<name>` encoding round-trips cleanly through
 /// the filesystem-probing decoder (single dash at a genuine `/` boundary).
-const CURSOR_CWD: &str = "/tmp/cc_session_cursor_test_dir";
+const CURSOR_CWD: &str = "/tmp/agent_session_cursor_test_dir";
 
 /// Encode a cwd into a Claude project dir name (mirrors the crate's encoding).
 fn encode_claude(cwd: &str) -> String {
@@ -114,7 +114,7 @@ fn reconstructs_cursor_session_into_native_claude() {
     let cloned = Session {
         id: result.new_id.clone(),
         project_path: encode_claude(CURSOR_CWD),
-        project_name: "cc_session_cursor_test_dir".to_string(),
+        project_name: "agent_session_cursor_test_dir".to_string(),
         git_branch: None,
         timestamp: chrono::Utc::now(),
         first_message: String::new(),
@@ -165,7 +165,7 @@ fn seeds_new_cursor_chat_from_claude() {
     // The import file holds the full prior conversation for cursor-agent to read.
     let import = cursor_home
         .path()
-        .join("cc-session-imports")
+        .join("agent-session-imports")
         .join(format!("{}.md", result.new_id));
     let doc = std::fs::read_to_string(&import).expect("import file written");
     assert!(doc.contains("Refactor the payment module."));

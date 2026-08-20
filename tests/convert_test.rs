@@ -1,9 +1,9 @@
 use std::path::Path;
 
-use cc_session::codex::{discover_codex_sessions, load_codex_conversation};
-use cc_session::convert::clone_to_other_agent;
-use cc_session::discovery::load_conversation;
-use cc_session::session::{Agent, MessageRole, Session};
+use agent_session::codex::{discover_codex_sessions, load_codex_conversation};
+use agent_session::convert::clone_to_other_agent;
+use agent_session::discovery::load_conversation;
+use agent_session::session::{Agent, MessageRole, Session};
 
 use serial_test::serial;
 

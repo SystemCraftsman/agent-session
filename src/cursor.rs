@@ -90,16 +90,27 @@ pub fn discover_cursor_sessions(cursor_home: &Path) -> Vec<Session> {
 }
 
 /// Path to the Cursor title sidecar (Cursor keeps titles server-side, so we
-/// store cc-session custom titles locally like Codex).
+/// store custom titles locally like Codex).
 fn cursor_titles_path(cursor_home: &Path) -> PathBuf {
+    cursor_home.join("agent-session-titles.json")
+}
+
+/// Legacy sidecar path from the tool's former `cc-session` name. Read as a
+/// fallback so titles saved before the rename are not lost.
+fn legacy_cursor_titles_path(cursor_home: &Path) -> PathBuf {
     cursor_home.join("cc-session-titles.json")
 }
 
-/// Load the id -> custom-title map, or an empty map on any error.
+/// Load the id -> custom-title map, or an empty map on any error. The legacy
+/// `cc-session-titles.json` is read as a fallback when the current sidecar is
+/// absent.
 pub fn load_cursor_titles(cursor_home: &Path) -> HashMap<String, String> {
-    match fs::read_to_string(cursor_titles_path(cursor_home)) {
-        Ok(data) => serde_json::from_str(&data).unwrap_or_default(),
-        Err(_) => HashMap::new(),
+    let read = |p: PathBuf| fs::read_to_string(p).ok();
+    match read(cursor_titles_path(cursor_home))
+        .or_else(|| read(legacy_cursor_titles_path(cursor_home)))
+    {
+        Some(data) => serde_json::from_str(&data).unwrap_or_default(),
+        None => HashMap::new(),
     }
 }
 
