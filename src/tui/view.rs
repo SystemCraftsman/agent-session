@@ -1,13 +1,24 @@
 use chrono::Utc;
 use chrono_humanize::{Accuracy, HumanTime, Tense};
-use ratatui::prelude::*;
 use ratatui::layout::Margin;
-use ratatui::widgets::{Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState};
+use ratatui::prelude::*;
+use ratatui::widgets::{
+    Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
+};
 
-use crate::session::{ConversationMessage, MessageRole};
+use crate::session::{Agent, ConversationMessage, MessageRole};
 
 use super::table;
 use super::{App, ContentSearchState, Mode, TreeRow};
+
+/// Return the display badge and color for a session's agent.
+fn agent_badge(agent: Agent) -> (&'static str, Color) {
+    match agent {
+        Agent::Claude => ("[CLAUDE] ", Color::Blue),
+        Agent::Codex => ("[CODEX] ", Color::Magenta),
+        Agent::Cursor => ("[CURSOR] ", Color::Cyan),
+    }
+}
 
 /// Render the full TUI frame.
 pub fn render(frame: &mut Frame, app: &mut App) {
@@ -31,6 +42,9 @@ pub fn render(frame: &mut Frame, app: &mut App) {
 
     if app.mode == Mode::MoveSelectProject {
         render_move_picker(frame, app, area);
+    }
+    if app.mode == Mode::ForkSelectAgent {
+        render_fork_picker(frame, app, area);
     }
 }
 
@@ -72,11 +86,14 @@ fn render_flat_session_list(frame: &mut Frame, app: &App, area: Rect) {
             ("  ", 2)
         };
 
+        let (agent_tag, agent_color) = agent_badge(session.agent);
+        let agent_tag_len = agent_tag.chars().count();
+
         let label = app.session_display_label(session);
-        let max_msg_len = width.saturating_sub(cursor_len + right_len + 2);
+        let max_msg_len = width.saturating_sub(cursor_len + agent_tag_len + right_len + 2);
         let msg = truncate_str(&label, max_msg_len);
         let msg_len = msg.chars().count();
-        let pad = width.saturating_sub(cursor_len + msg_len + right_len);
+        let pad = width.saturating_sub(cursor_len + agent_tag_len + msg_len + right_len);
         let padding = " ".repeat(pad);
 
         let msg_style = if is_selected {
@@ -89,6 +106,7 @@ fn render_flat_session_list(frame: &mut Frame, app: &App, area: Rect) {
         let cursor_style = Style::default().fg(app.theme.cursor_color);
 
         let mut spans = vec![Span::styled(cursor, cursor_style)];
+        spans.push(Span::styled(agent_tag, Style::default().fg(agent_color)));
         spans.extend(highlight_terms(&msg, &term_refs, msg_style, &app.theme));
         spans.push(Span::raw(padding));
         spans.push(Span::styled(right, dim));
@@ -157,7 +175,11 @@ fn render_grouped_session_list(frame: &mut Frame, app: &App, area: Rect) {
         match row {
             TreeRow::Project(gi) => {
                 let group = &app.project_groups[*gi];
-                let icon = if group.expanded { "\u{25BC}" } else { "\u{25B6}" };
+                let icon = if group.expanded {
+                    "\u{25BC}"
+                } else {
+                    "\u{25B6}"
+                };
                 let count = group.session_indices.len();
                 let label = format!("{} {} ({})", icon, group.name, count);
                 let label_len = label.chars().count();
@@ -199,11 +221,16 @@ fn render_grouped_session_list(frame: &mut Frame, app: &App, area: Rect) {
                     ("- ", 2)
                 };
 
+                let (agent_tag, agent_color) = agent_badge(session.agent);
+                let agent_tag_len = agent_tag.chars().count();
+
                 let label = app.session_display_label(session);
-                let max_msg_len = width.saturating_sub(indent_len + cursor_len + right_len + 2);
+                let max_msg_len =
+                    width.saturating_sub(indent_len + cursor_len + agent_tag_len + right_len + 2);
                 let msg = truncate_str(&label, max_msg_len);
                 let msg_len = msg.chars().count();
-                let pad = width.saturating_sub(indent_len + cursor_len + msg_len + right_len);
+                let pad = width
+                    .saturating_sub(indent_len + cursor_len + agent_tag_len + msg_len + right_len);
                 let padding = " ".repeat(pad);
 
                 let msg_style = if is_selected {
@@ -215,10 +242,8 @@ fn render_grouped_session_list(frame: &mut Frame, app: &App, area: Rect) {
                 let dim = Style::default().fg(app.theme.text_dim);
                 let cursor_style = Style::default().fg(app.theme.cursor_color);
 
-                let mut spans = vec![
-                    Span::raw(indent),
-                    Span::styled(cursor, cursor_style),
-                ];
+                let mut spans = vec![Span::raw(indent), Span::styled(cursor, cursor_style)];
+                spans.push(Span::styled(agent_tag, Style::default().fg(agent_color)));
                 spans.extend(highlight_terms(&msg, &term_refs, msg_style, &app.theme));
                 spans.push(Span::raw(padding));
                 spans.push(Span::styled(right, dim));
@@ -234,7 +259,9 @@ fn render_grouped_session_list(frame: &mut Frame, app: &App, area: Rect) {
         }
     }
 
-    let session_count: usize = app.project_groups.iter()
+    let session_count: usize = app
+        .project_groups
+        .iter()
         .map(|g| g.session_indices.len())
         .sum();
     let text = Text::from(lines);
@@ -281,7 +308,9 @@ fn render_move_picker(frame: &mut Frame, app: &App, area: Rect) {
     };
 
     let max_w = 50u16.min(area.width.saturating_sub(4));
-    let max_h = (state.projects.len() as u16 + 2).min(area.height.saturating_sub(4)).max(4);
+    let max_h = (state.projects.len() as u16 + 2)
+        .min(area.height.saturating_sub(4))
+        .max(4);
     let x = (area.width.saturating_sub(max_w)) / 2;
     let y = (area.height.saturating_sub(max_h)) / 2;
     let popup_area = Rect::new(x, y, max_w, max_h);
@@ -304,7 +333,10 @@ fn render_move_picker(frame: &mut Frame, app: &App, area: Rect) {
         let (_, ref name, _) = state.projects[i];
         let is_sel = i == state.selected;
         let (prefix, style) = if is_sel {
-            ("\u{27A4} ", Style::default().fg(app.theme.cursor_color).bold())
+            (
+                "\u{27A4} ",
+                Style::default().fg(app.theme.cursor_color).bold(),
+            )
         } else {
             ("  ", Style::default().fg(app.theme.text))
         };
@@ -337,6 +369,74 @@ fn render_move_picker(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(paragraph, popup_area);
 }
 
+/// Render the target-agent picker for forking a session.
+fn render_fork_picker(frame: &mut Frame, app: &App, area: Rect) {
+    let state = match &app.fork_state {
+        Some(s) => s,
+        None => return,
+    };
+
+    let max_w = 44u16.min(area.width.saturating_sub(4)).max(20);
+    let max_h = (state.options.len() as u16 + 2)
+        .min(area.height.saturating_sub(4))
+        .max(4);
+    let x = (area.width.saturating_sub(max_w)) / 2;
+    let y = (area.height.saturating_sub(max_h)) / 2;
+    let popup_area = Rect::new(x, y, max_w, max_h);
+
+    frame.render_widget(ratatui::widgets::Clear, popup_area);
+
+    let inner_w = max_w.saturating_sub(2) as usize;
+    let mut lines: Vec<Line> = Vec::new();
+    for (i, agent) in state.options.iter().enumerate() {
+        let is_sel = i == state.selected;
+        let (prefix, style) = if is_sel {
+            (
+                "\u{27A4} ",
+                Style::default().fg(app.theme.cursor_color).bold(),
+            )
+        } else {
+            ("  ", Style::default().fg(app.theme.text))
+        };
+        let name = match agent {
+            crate::session::Agent::Claude => "Claude",
+            crate::session::Agent::Codex => "Codex",
+            crate::session::Agent::Cursor => "Cursor",
+        };
+        // Cursor is cloud-backed, so any Cursor target is context-seeded ("seed").
+        // A same-agent Claude/Codex target is a native fork; anything else is a
+        // native reconstruction.
+        let kind = if *agent == crate::session::Agent::Cursor {
+            "seed"
+        } else if *agent == state.session.agent {
+            "fork"
+        } else {
+            "reconstruct"
+        };
+        let label = format!("{name} ({kind})");
+        let pad = inner_w.saturating_sub(prefix.chars().count() + label.chars().count());
+        let line = Line::from(vec![
+            Span::styled(prefix, style),
+            Span::styled(label, style),
+            Span::raw(" ".repeat(pad)),
+        ]);
+        if is_sel {
+            lines.push(line.patch_style(Style::default().bg(app.theme.selected_bg)));
+        } else {
+            lines.push(line);
+        }
+    }
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(app.theme.cursor_color))
+        .title(" Fork to agent ")
+        .title_style(Style::default().fg(app.theme.cursor_color).bold());
+
+    let paragraph = Paragraph::new(Text::from(lines)).block(block);
+    frame.render_widget(paragraph, popup_area);
+}
+
 const MAX_CONTENT_WIDTH: u16 = 120;
 
 /// Render the conversation viewer.
@@ -350,14 +450,20 @@ fn render_conversation(frame: &mut Frame, app: &mut App, area: Rect) {
     let status_area = chunks[1];
 
     // Build title bar: session name + search match info
-    let session_title = app.conversation.as_ref()
+    let session_title = app
+        .conversation
+        .as_ref()
         .and_then(|conv| conv.session.custom_title.as_deref())
         .unwrap_or("");
 
     let search_info = if let Some(conv) = &app.conversation {
         let has_search = conv.search_confirmed || !conv.initial_search_terms.is_empty();
         if has_search && !conv.match_positions.is_empty() {
-            format!(" ({}/{})", conv.current_match + 1, conv.match_positions.len())
+            format!(
+                " ({}/{})",
+                conv.current_match + 1,
+                conv.match_positions.len()
+            )
         } else {
             String::new()
         }
@@ -415,9 +521,7 @@ fn render_conversation(frame: &mut Frame, app: &mut App, area: Rect) {
 
             conv.match_positions = find_match_positions(&conv.lines, &term_refs);
 
-            if !conv.match_positions.is_empty()
-                && conv.scroll_offset == 0
-                && !conv.search_confirmed
+            if !conv.match_positions.is_empty() && conv.scroll_offset == 0 && !conv.search_confirmed
             {
                 let match_line = conv.match_positions[0];
                 let max = conv.lines.len().saturating_sub(height);
@@ -476,8 +580,8 @@ fn render_conversation(frame: &mut Frame, app: &mut App, area: Rect) {
             .thumb_style(Style::default().fg(app.theme.text_dim))
             .begin_symbol(None)
             .end_symbol(None);
-        let mut scrollbar_state = ScrollbarState::new(total_lines.saturating_sub(height))
-            .position(conv.scroll_offset);
+        let mut scrollbar_state =
+            ScrollbarState::new(total_lines.saturating_sub(height)).position(conv.scroll_offset);
         frame.render_stateful_widget(
             scrollbar,
             full_content_area.inner(Margin {
@@ -513,7 +617,9 @@ fn render_conversation_status(frame: &mut Frame, app: &App, area: Rect) {
                 // Show entire query as selected (inverted)
                 spans.push(Span::styled(
                     &conv.search_query,
-                    Style::default().fg(Color::Black).bg(app.theme.status_label_bg),
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(app.theme.status_label_bg),
                 ));
             } else {
                 // Show query with block cursor at position
@@ -549,7 +655,10 @@ fn render_conversation_status(frame: &mut Frame, app: &App, area: Rect) {
             let project_label = format_project_label(&conv.session);
             let cyan = Style::default().fg(app.theme.status_label_bg);
             Line::from(vec![
-                Span::styled(format!(" {} ", project_label), Style::default().fg(Color::Green).bold()),
+                Span::styled(
+                    format!(" {} ", project_label),
+                    Style::default().fg(Color::Green).bold(),
+                ),
                 Span::styled(format!(" {} ", conv.search_query), cyan),
                 Span::raw(" "),
                 Span::styled("n/N next/prev  / search  Esc clear  Enter copy & exit", dim),
@@ -559,7 +668,10 @@ fn render_conversation_status(frame: &mut Frame, app: &App, area: Rect) {
             let filter_text = conv.initial_search_terms.join(" ");
             let cyan = Style::default().fg(app.theme.status_label_bg);
             Line::from(vec![
-                Span::styled(format!(" {} ", project_label), Style::default().fg(Color::Green).bold()),
+                Span::styled(
+                    format!(" {} ", project_label),
+                    Style::default().fg(Color::Green).bold(),
+                ),
                 Span::styled(format!(" {} ", filter_text), cyan),
                 Span::raw(" "),
                 Span::styled("n/N next/prev  / search  Esc clear  Enter copy & exit", dim),
@@ -582,8 +694,7 @@ fn render_conversation_status(frame: &mut Frame, app: &App, area: Rect) {
         Line::from("")
     };
 
-    let bar =
-        Paragraph::new(content).style(Style::default().bg(app.theme.status_bar_bg));
+    let bar = Paragraph::new(content).style(Style::default().bg(app.theme.status_bar_bg));
     frame.render_widget(bar, area);
 }
 
@@ -616,11 +727,7 @@ fn pre_render_conversation(
         let time_ago = HumanTime::from(-delta).to_text_en(Accuracy::Rough, Tense::Past);
 
         let (label, header_bg, header_fg): (&str, Color, Color) = match msg.role {
-            MessageRole::User => (
-                " \u{25B6} You ",
-                theme.user_header_bg,
-                theme.user_header_fg,
-            ),
+            MessageRole::User => (" \u{25B6} You ", theme.user_header_bg, theme.user_header_fg),
             MessageRole::Assistant => (
                 " \u{25C0} Claude ",
                 theme.assistant_header_bg,
@@ -670,8 +777,7 @@ fn pre_render_conversation(
             if trimmed.starts_with("```") {
                 if in_code_fence {
                     // Closing fence: render buffered code
-                    let code_refs: Vec<&str> =
-                        code_buffer.iter().map(|s| s.as_str()).collect();
+                    let code_refs: Vec<&str> = code_buffer.iter().map(|s| s.as_str()).collect();
                     let highlighted = code_lang.as_ref().and_then(|lang| {
                         syntax_highlighter.highlight_code(
                             &code_refs,
@@ -705,8 +811,7 @@ fn pre_render_conversation(
                 } else {
                     // Opening fence: extract language
                     in_code_fence = true;
-                    code_lang =
-                        super::syntax::extract_language(trimmed);
+                    code_lang = super::syntax::extract_language(trimmed);
                 }
                 i += 1;
                 continue;
@@ -729,9 +834,7 @@ fn pre_render_conversation(
 
                 if table_lines.len() >= 2 {
                     let table_refs: Vec<&str> = table_lines.to_vec();
-                    if let Some(rendered) =
-                        table::render_table_lines(&table_refs, width, theme)
-                    {
+                    if let Some(rendered) = table::render_table_lines(&table_refs, width, theme) {
                         // Apply message background to table lines if user message
                         for tl in rendered {
                             if let Some(bg) = msg_bg {
@@ -752,8 +855,7 @@ fn pre_render_conversation(
                 let level = trimmed.chars().take_while(|&c| c == '#').count();
                 let heading_text = trimmed[level..].trim_start();
                 let prefix = "\u{2500}".repeat(level.min(3));
-                let wrapped =
-                    wrap_line(heading_text, width.saturating_sub(prefix.len() + 1));
+                let wrapped = wrap_line(heading_text, width.saturating_sub(prefix.len() + 1));
                 let heading_with_bg = heading_style.bg(theme.heading_bg);
                 for (idx, wl) in wrapped.into_iter().enumerate() {
                     let mut spans = Vec::new();
@@ -787,10 +889,7 @@ fn pre_render_conversation(
             if trimmed.is_empty() {
                 if let Some(bg) = msg_bg {
                     let pad = " ".repeat(width);
-                    lines.push(Line::from(Span::styled(
-                        pad,
-                        Style::default().bg(bg),
-                    )));
+                    lines.push(Line::from(Span::styled(pad, Style::default().bg(bg))));
                 } else {
                     lines.push(Line::from(""));
                 }
@@ -801,14 +900,11 @@ fn pre_render_conversation(
             // Normal text with markdown inline rendering
             let wrapped = wrap_line(text_line, width);
             for wl in wrapped {
-                let spans =
-                    render_markdown_inline(&wl, base_style, search_terms, theme);
+                let spans = render_markdown_inline(&wl, base_style, search_terms, theme);
                 let line = Line::from(spans);
                 if let Some(bg) = msg_bg {
                     if !has_bg_set(&line) {
-                        lines.push(
-                            line.patch_style(Style::default().bg(bg)),
-                        );
+                        lines.push(line.patch_style(Style::default().bg(bg)));
                     } else {
                         lines.push(line);
                     }
@@ -838,9 +934,7 @@ fn pre_render_conversation(
 
 /// Check if any span in a line already has a background set.
 fn has_bg_set(line: &Line) -> bool {
-    line.spans
-        .iter()
-        .any(|s| s.style.bg.is_some())
+    line.spans.iter().any(|s| s.style.bg.is_some())
 }
 
 /// Find line indices that contain search term matches.
@@ -922,7 +1016,13 @@ fn render_title_edit_bar(app: &App) -> Line<'static> {
     if let Some(state) = &app.title_edit {
         let is_new = matches!(state.context, super::TitleEditContext::NewSession { .. });
         let is_fork = matches!(state.context, super::TitleEditContext::Fork { .. });
-        let label = if is_fork { " Fork title: " } else if is_new { " New session: " } else { " Title: " };
+        let label = if is_fork {
+            " Fork title: "
+        } else if is_new {
+            " New session: "
+        } else {
+            " Title: "
+        };
         let hint = if is_fork {
             "Enter fork  Esc cancel  (empty = no name)"
         } else if is_new {
@@ -939,7 +1039,10 @@ fn render_title_edit_bar(app: &App) -> Line<'static> {
         let cursor_pos = state.cursor.min(state.query.len());
         let (before, rest) = state.query.split_at(cursor_pos);
         if !before.is_empty() {
-            spans.push(Span::styled(before.to_string(), Style::default().fg(Color::White)));
+            spans.push(Span::styled(
+                before.to_string(),
+                Style::default().fg(Color::White),
+            ));
         }
         if let Some(ch) = rest.chars().next() {
             spans.push(Span::styled(
@@ -948,7 +1051,10 @@ fn render_title_edit_bar(app: &App) -> Line<'static> {
             ));
             let after = &rest[ch.len_utf8()..];
             if !after.is_empty() {
-                spans.push(Span::styled(after.to_string(), Style::default().fg(Color::White)));
+                spans.push(Span::styled(
+                    after.to_string(),
+                    Style::default().fg(Color::White),
+                ));
             }
         } else {
             spans.push(Span::styled(
@@ -975,7 +1081,25 @@ fn render_status_bar(frame: &mut Frame, app: &App, area: Rect) {
         Mode::MoveSelectProject => {
             let key_style = Style::default().fg(Color::White).bold();
             Line::from(vec![
-                Span::styled(" Select target project: ", Style::default().fg(app.theme.cursor_color).bold()),
+                Span::styled(
+                    " Select target project: ",
+                    Style::default().fg(app.theme.cursor_color).bold(),
+                ),
+                Span::styled("↑↓", key_style),
+                Span::styled(" navigate  ", dim),
+                Span::styled("Enter", key_style),
+                Span::styled(" confirm  ", dim),
+                Span::styled("Esc", key_style),
+                Span::styled(" cancel", dim),
+            ])
+        }
+        Mode::ForkSelectAgent => {
+            let key_style = Style::default().fg(Color::White).bold();
+            Line::from(vec![
+                Span::styled(
+                    " Fork to which agent: ",
+                    Style::default().fg(app.theme.cursor_color).bold(),
+                ),
                 Span::styled("↑↓", key_style),
                 Span::styled(" navigate  ", dim),
                 Span::styled("Enter", key_style),
@@ -1040,20 +1164,13 @@ fn render_status_bar(frame: &mut Frame, app: &App, area: Rect) {
                     "Tab grouped view"
                 };
                 let mut spans: Vec<Span> = Vec::new();
-                // Optional local-router indicators. Hidden entirely when no
-                // router setup is present (see App::router_enabled / profile_label).
                 if let Some(profile) = &app.profile_label {
-                    spans.push(Span::styled(" profile: ", dim));
-                    spans.push(Span::styled(profile.clone(), Style::default().fg(app.theme.text)));
-                    spans.push(Span::raw("  "));
-                }
-                if let Some(on) = app.router_enabled {
-                    spans.push(Span::styled("router: ", dim));
+                    spans.push(Span::styled(" claude profile: ", dim));
                     spans.push(Span::styled(
-                        if on { "on" } else { "off" },
-                        Style::default().fg(if on { Color::Green } else { Color::Yellow }),
+                        profile.clone(),
+                        Style::default().fg(app.theme.text),
                     ));
-                    spans.push(Span::styled("  |  ", dim));
+                    spans.push(Span::raw("  "));
                 }
                 spans.extend([
                     Span::styled(" Enter ", dim),
@@ -1071,6 +1188,9 @@ fn render_status_bar(frame: &mut Frame, app: &App, area: Rect) {
                     Span::styled("^v ", dim),
                     Span::styled("move", dim),
                     Span::raw("  "),
+                    Span::styled("^f ", dim),
+                    Span::styled("fork", dim),
+                    Span::raw("  "),
                     Span::styled("Esc ", dim),
                     Span::styled("quit", dim),
                     Span::raw("  "),
@@ -1083,8 +1203,7 @@ fn render_status_bar(frame: &mut Frame, app: &App, area: Rect) {
         }
     };
 
-    let bar =
-        Paragraph::new(content).style(Style::default().bg(app.theme.status_bar_bg));
+    let bar = Paragraph::new(content).style(Style::default().bg(app.theme.status_bar_bg));
     frame.render_widget(bar, area);
 }
 
@@ -1184,9 +1303,7 @@ fn render_markdown_inline<'a>(
     }
 
     // Post-process: detect URLs and style them
-    let link_style = base_style
-        .fg(theme.link)
-        .add_modifier(Modifier::UNDERLINED);
+    let link_style = base_style.fg(theme.link).add_modifier(Modifier::UNDERLINED);
     let processed: Vec<(String, Style)> = spans
         .into_iter()
         .flat_map(|(text, style)| split_urls(&text, style, link_style))
@@ -1235,12 +1352,23 @@ fn split_urls(text: &str, base_style: Style, link_style: Style) -> Vec<(String, 
                 // Extract URL (until whitespace, closing paren/bracket, or end)
                 let url_start = &remaining[pos..];
                 let url_end = url_start[earliest_prefix_len..]
-                    .find(|c: char| c.is_whitespace() || c == ')' || c == ']' || c == '>' || c == '"' || c == '\'')
+                    .find(|c: char| {
+                        c.is_whitespace()
+                            || c == ')'
+                            || c == ']'
+                            || c == '>'
+                            || c == '"'
+                            || c == '\''
+                    })
                     .map(|p| p + earliest_prefix_len)
                     .unwrap_or(url_start.len());
                 // Trim trailing punctuation that's likely not part of the URL
                 let mut url = &url_start[..url_end];
-                while url.ends_with('.') || url.ends_with(',') || url.ends_with(';') || url.ends_with(':') {
+                while url.ends_with('.')
+                    || url.ends_with(',')
+                    || url.ends_with(';')
+                    || url.ends_with(':')
+                {
                     url = &url[..url.len() - 1];
                 }
                 parts.push((url.to_string(), link_style));

@@ -1,3 +1,6 @@
+mod codex;
+mod convert;
+mod cursor;
 mod discovery;
 mod filter;
 mod router;
@@ -69,16 +72,26 @@ fn main() {
 
     let claude_home = get_claude_home();
     let projects_dir = claude_home.join("projects");
+    let codex_home = codex::get_codex_home();
+    let codex_sessions_dir = codex_home.join("sessions");
+    let cursor_home = cursor::get_cursor_home();
+    let cursor_projects_dir = cursor_home.join("projects");
 
-    if !projects_dir.is_dir() {
+    if !projects_dir.is_dir() && !codex_sessions_dir.is_dir() && !cursor_projects_dir.is_dir() {
         eprintln!(
-            "No Claude projects directory found at {}",
-            projects_dir.display()
+            "No sessions found (looked in {}, {} and {})",
+            projects_dir.display(),
+            codex_sessions_dir.display(),
+            cursor_projects_dir.display()
         );
         std::process::exit(2);
     }
 
-    let sessions = discover_sessions(&claude_home);
+    let mut sessions = discover_sessions(&claude_home);
+    sessions.extend(codex::discover_codex_sessions(&codex_home));
+    sessions.extend(cursor::discover_cursor_sessions(&cursor_home));
+    // Merge all agents into a single newest-first list.
+    sessions.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
 
     // Apply --since filter
     let since_duration = cli.since.map(|s| {

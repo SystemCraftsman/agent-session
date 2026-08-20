@@ -43,6 +43,32 @@ fn current_selection_cwd(app: &App) -> Option<String> {
     }
 }
 
+/// Resolve which agent owns the current selection, so per-agent actions (e.g.
+/// launching a new session) use the right CLI. A project header reports its
+/// first (newest) session's agent.
+fn current_selection_agent(app: &App) -> Option<crate::session::Agent> {
+    if app.grouped_view {
+        match app.selected_tree_row().cloned() {
+            Some(TreeRow::Project(gi)) => {
+                let di = *app.project_groups.get(gi)?.session_indices.first()?;
+                Some(app.display_session(app.display_entries.get(di)?).agent)
+            }
+            Some(TreeRow::Session { display_idx, .. }) => Some(
+                app.display_session(app.display_entries.get(display_idx)?)
+                    .agent,
+            ),
+            None => None,
+        }
+    } else if app.selected < app.display_entries.len() {
+        Some(
+            app.display_session(&app.display_entries[app.selected])
+                .agent,
+        )
+    } else {
+        None
+    }
+}
+
 /// Handle a key event and return the resulting action.
 pub fn handle_input(app: &mut App, key: KeyEvent) -> Action {
     // Ctrl-C always quits
@@ -56,6 +82,7 @@ pub fn handle_input(app: &mut App, key: KeyEvent) -> Action {
         Mode::ConversationSearch => handle_conversation_search(app, key),
         Mode::ConfirmArchive => handle_confirm_archive(app, key),
         Mode::MoveSelectProject => handle_move_select(app, key),
+        Mode::ForkSelectAgent => handle_fork_select(app, key),
         Mode::TitleEdit => handle_title_edit(app, key),
     }
 }
@@ -115,7 +142,11 @@ fn handle_browse(app: &mut App, key: KeyEvent) -> Action {
                     }
                     Some(TreeRow::Session { project_idx, .. }) => {
                         // Jump to parent project header
-                        if let Some(pos) = app.tree_rows.iter().position(|r| *r == TreeRow::Project(project_idx)) {
+                        if let Some(pos) = app
+                            .tree_rows
+                            .iter()
+                            .position(|r| *r == TreeRow::Project(project_idx))
+                        {
                             app.selected = pos;
                         }
                     }
@@ -195,6 +226,12 @@ fn handle_browse(app: &mut App, key: KeyEvent) -> Action {
             }
             if ctrl && c == 'n' {
                 if let Some(cwd) = current_selection_cwd(app).filter(|c| !c.is_empty()) {
+                    // Codex has no session-name flag, so launch directly without
+                    // the title prompt Claude uses.
+                    if current_selection_agent(app) == Some(crate::session::Agent::Codex) {
+                        let escaped_cwd = cwd.replace('\'', "'\\''");
+                        return Action::NewSession(format!("cd '{}' && codex", escaped_cwd));
+                    }
                     app.start_new_session_title(cwd);
                 }
                 return Action::Continue;
@@ -210,6 +247,12 @@ fn handle_browse(app: &mut App, key: KeyEvent) -> Action {
             if ctrl && c == 'v' {
                 if let Some(idx) = current_selection_idx(app) {
                     app.start_move(idx);
+                }
+                return Action::Continue;
+            }
+            if ctrl && c == 'f' {
+                if let Some(idx) = current_selection_idx(app) {
+                    app.start_fork(idx);
                 }
                 return Action::Continue;
             }
@@ -238,8 +281,7 @@ fn handle_conversation(app: &mut App, key: KeyEvent) -> Action {
         KeyCode::Esc => {
             // First Esc: clear highlights if any are active
             if let Some(conv) = &mut app.conversation {
-                let has_highlights = !conv.initial_search_terms.is_empty()
-                    || conv.search_confirmed;
+                let has_highlights = !conv.initial_search_terms.is_empty() || conv.search_confirmed;
                 if has_highlights {
                     conv.initial_search_terms.clear();
                     conv.search_confirmed = false;
@@ -456,6 +498,78 @@ fn handle_conversation_search(app: &mut App, key: KeyEvent) -> Action {
     }
 }
 
+fn handle_fork_select(app: &mut App, key: KeyEvent) -> Action {
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('q') => {
+            app.fork_state = None;
+            app.mode = Mode::Browsing;
+            Action::Continue
+        }
+        KeyCode::Enter => {
+            let Some(state) = app.fork_state.take() else {
+                app.mode = Mode::Browsing;
+                return Action::Continue;
+            };
+            app.mode = Mode::Browsing;
+            let target = state.options[state.selected];
+            let session = state.session;
+            // Claude and Codex have a native same-agent fork; Cursor does not,
+            // so a Cursor->Cursor "fork" is context-seeded like any Cursor target.
+            let native_fork = target == session.agent
+                && matches!(
+                    session.agent,
+                    crate::session::Agent::Claude | crate::session::Agent::Codex
+                );
+            if native_fork {
+                Action::ForkSession(native_fork_command(&session))
+            } else {
+                // Reconstruct (Claude/Codex targets) or context-seed (Cursor).
+                match crate::convert::clone_to_other_agent(&session, target) {
+                    Ok(result) => {
+                        app.set_status(format!("Forking into new session {}", result.new_id));
+                        Action::CloneSession(result.resume_command)
+                    }
+                    Err(e) => {
+                        app.set_status(format!("Fork failed: {e}"));
+                        Action::Continue
+                    }
+                }
+            }
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            if let Some(state) = &mut app.fork_state {
+                if state.selected + 1 < state.options.len() {
+                    state.selected += 1;
+                }
+            }
+            Action::Continue
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            if let Some(state) = &mut app.fork_state {
+                state.selected = state.selected.saturating_sub(1);
+            }
+            Action::Continue
+        }
+        _ => Action::Continue,
+    }
+}
+
+/// Build the shell command for a native (same-agent) fork of `session`.
+fn native_fork_command(session: &crate::session::Session) -> String {
+    let cwd = session.cwd.replace('\'', "'\\''");
+    match session.agent {
+        crate::session::Agent::Claude => {
+            format!("cd '{}' && claude -r {} --fork-session", cwd, session.id)
+        }
+        crate::session::Agent::Codex => {
+            format!("cd '{}' && codex fork {}", cwd, session.id)
+        }
+        // Cursor has no native fork; the caller routes Cursor targets through
+        // context seeding, so this is only a defensive fallback.
+        crate::session::Agent::Cursor => session.resume_command(),
+    }
+}
+
 fn handle_move_select(app: &mut App, key: KeyEvent) -> Action {
     match key.code {
         KeyCode::Esc | KeyCode::Char('q') => {
@@ -516,16 +630,14 @@ fn handle_title_edit(app: &mut App, key: KeyEvent) -> Action {
             app.cancel_title_edit();
             Action::Continue
         }
-        KeyCode::Enter => {
-            match app.finish_title_edit() {
-                Ok(Some(action)) => action,
-                Ok(None) => Action::Continue,
-                Err(msg) => {
-                    app.set_status(msg);
-                    Action::Continue
-                }
+        KeyCode::Enter => match app.finish_title_edit() {
+            Ok(Some(action)) => action,
+            Ok(None) => Action::Continue,
+            Err(msg) => {
+                app.set_status(msg);
+                Action::Continue
             }
-        }
+        },
         KeyCode::Backspace => {
             if let Some(state) = &mut app.title_edit {
                 if state.cursor > 0 {

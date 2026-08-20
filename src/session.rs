@@ -3,7 +3,18 @@
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 
-/// A discovered Claude Code session with metadata.
+/// Which agent CLI owns a session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Agent {
+    /// Claude Code (`~/.claude/projects`).
+    Claude,
+    /// OpenAI Codex CLI (`~/.codex/sessions`).
+    Codex,
+    /// Cursor CLI / cursor-agent (`~/.cursor/projects`).
+    Cursor,
+}
+
+/// A discovered agent session (Claude, Codex or Cursor) with metadata.
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct Session {
@@ -16,6 +27,12 @@ pub struct Session {
     pub cwd: String,
     pub project_exists: bool,
     pub custom_title: Option<String>,
+    /// Which agent CLI owns this session.
+    pub agent: Agent,
+    /// Absolute path to the session's source file. `None` for Claude sessions
+    /// (reconstructed from `project_path`); set for Codex rollout files, whose
+    /// `project_path` holds the cwd for grouping rather than the file location.
+    pub source_path: Option<String>,
 }
 
 impl Session {
@@ -24,15 +41,31 @@ impl Session {
     /// The path is single-quoted to handle spaces and special characters.
     pub fn resume_command(&self) -> String {
         let escaped_cwd = self.cwd.replace('\'', "'\\''");
-        match &self.custom_title {
-            Some(title) if !title.is_empty() => {
-                let escaped_title = title.replace('\'', "'\\''");
-                format!("cd '{}' && claude -r {} -n '{}'", escaped_cwd, self.id, escaped_title)
+        match self.agent {
+            // Codex resolves to the user's `codex` shell function when run
+            // through an interactive shell, mirroring the `claude` wrapper.
+            Agent::Codex => {
+                format!("cd '{}' && codex resume {}", escaped_cwd, self.id)
             }
-            _ => format!("cd '{}' && claude -r {}", escaped_cwd, self.id),
+            // Claude resolves to the user's `claude` shell function when run
+            // through an interactive shell.
+            Agent::Claude => match &self.custom_title {
+                Some(title) if !title.is_empty() => {
+                    let escaped_title = title.replace('\'', "'\\''");
+                    format!(
+                        "cd '{}' && claude -r {} -n '{}'",
+                        escaped_cwd, self.id, escaped_title
+                    )
+                }
+                _ => format!("cd '{}' && claude -r {}", escaped_cwd, self.id),
+            },
+            // Cursor resolves to the user's `cursor-agent` binary. Resume is
+            // keyed by chat id; cursor-agent has no title flag on resume.
+            Agent::Cursor => {
+                format!("cd '{}' && cursor-agent --resume {}", escaped_cwd, self.id)
+            }
         }
     }
-
 }
 
 /// A single line from a session JSONL file.

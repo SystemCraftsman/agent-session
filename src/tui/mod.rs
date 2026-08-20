@@ -34,6 +34,7 @@ pub enum Mode {
     ConversationSearch,
     ConfirmArchive,
     MoveSelectProject,
+    ForkSelectAgent,
     TitleEdit,
 }
 
@@ -78,9 +79,14 @@ pub enum Action {
     CopyCommand(String),
     NewSession(String),
     ForkSession(String),
+    CloneSession(String),
     BackToList,
     ArchiveSession(usize),
-    MoveSession { display_idx: usize, target_project: String, target_cwd: String },
+    MoveSession {
+        display_idx: usize,
+        target_project: String,
+        target_cwd: String,
+    },
 }
 
 /// A group of sessions belonging to the same project directory.
@@ -97,47 +103,68 @@ pub struct ProjectGroup {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TreeRow {
     Project(usize),
-    Session { project_idx: usize, display_idx: usize },
+    Session {
+        project_idx: usize,
+        display_idx: usize,
+    },
+}
+
+/// Encode a working directory into Claude's project-dir naming scheme
+/// (`/` and `.` become `-`). Used when a move target only has Codex sessions,
+/// so a Claude source can still be relocated into that directory.
+fn encode_claude_dir(cwd: &str) -> String {
+    cwd.replace(['/', '.'], "-")
 }
 
 /// Build project groups from a flat list of sessions.
 /// Groups are sorted by the latest session timestamp (newest group first).
 /// Sessions within each group are ordered by their position in `display_entries`.
-pub fn group_by_project(sessions: &[Session], display_entries: &[DisplayEntry]) -> Vec<ProjectGroup> {
+pub fn group_by_project(
+    sessions: &[Session],
+    display_entries: &[DisplayEntry],
+) -> Vec<ProjectGroup> {
     group_by_project_with_content(sessions, display_entries, &[])
 }
 
 /// Build project groups, including content-only search results.
-pub fn group_by_project_with_content(sessions: &[Session], display_entries: &[DisplayEntry], content_results: &[Session]) -> Vec<ProjectGroup> {
-    let mut group_map: std::collections::HashMap<String, Vec<usize>> = std::collections::HashMap::new();
+pub fn group_by_project_with_content(
+    sessions: &[Session],
+    display_entries: &[DisplayEntry],
+    content_results: &[Session],
+) -> Vec<ProjectGroup> {
+    let mut group_map: std::collections::HashMap<String, Vec<usize>> =
+        std::collections::HashMap::new();
 
     for (di, entry) in display_entries.iter().enumerate() {
         let session = match &entry.source {
             DisplaySource::Sessions(idx) => &sessions[*idx],
             DisplaySource::Content(idx) => &content_results[*idx],
         };
-        group_map
-            .entry(session.project_path.clone())
-            .or_default()
-            .push(di);
+        // Group by the real working directory so Claude and Codex sessions in
+        // the same project merge into one group (Claude keys on an encoded dir
+        // name, Codex on the raw cwd; the cwd is the common denominator).
+        let group_key = if session.cwd.is_empty() {
+            session.project_path.clone()
+        } else {
+            session.cwd.clone()
+        };
+        group_map.entry(group_key).or_default().push(di);
     }
 
     let mut groups: Vec<ProjectGroup> = group_map
         .into_iter()
         .map(|(path, indices)| {
-            let first_session = indices.first()
-                .and_then(|&di| {
-                    match &display_entries.get(di)?.source {
+            let first_session =
+                indices
+                    .first()
+                    .and_then(|&di| match &display_entries.get(di)?.source {
                         DisplaySource::Sessions(idx) => sessions.get(*idx),
                         DisplaySource::Content(idx) => content_results.get(*idx),
-                    }
-                });
+                    });
             let name = first_session
                 .map(|s| s.project_name.clone())
                 .unwrap_or_else(|| "unknown".to_string());
-            let cwd = first_session
-                .map(|s| s.cwd.clone())
-                .unwrap_or_default();
+            let cwd = first_session.map(|s| s.cwd.clone()).unwrap_or_default();
             ProjectGroup {
                 name,
                 path,
@@ -150,10 +177,14 @@ pub fn group_by_project_with_content(sessions: &[Session], display_entries: &[Di
 
     // Sort groups by latest activity (newest first)
     groups.sort_by(|a, b| {
-        let ts_a = a.session_indices.first()
+        let ts_a = a
+            .session_indices
+            .first()
             .map(|&i| display_entries[i].timestamp)
             .unwrap_or_else(|| DateTime::<Utc>::MIN_UTC);
-        let ts_b = b.session_indices.first()
+        let ts_b = b
+            .session_indices
+            .first()
             .map(|&i| display_entries[i].timestamp)
             .unwrap_or_else(|| DateTime::<Utc>::MIN_UTC);
         ts_b.cmp(&ts_a)
@@ -169,7 +200,10 @@ pub fn build_tree_rows(groups: &[ProjectGroup]) -> Vec<TreeRow> {
         rows.push(TreeRow::Project(gi));
         if group.expanded {
             for &di in &group.session_indices {
-                rows.push(TreeRow::Session { project_idx: gi, display_idx: di });
+                rows.push(TreeRow::Session {
+                    project_idx: gi,
+                    display_idx: di,
+                });
             }
         }
     }
@@ -179,7 +213,15 @@ pub fn build_tree_rows(groups: &[ProjectGroup]) -> Vec<TreeRow> {
 /// State for the project picker when moving a session.
 pub struct MoveState {
     pub display_idx: usize,
-    pub projects: Vec<(String, String, String)>,  // (encoded_path, display_name, cwd)
+    pub projects: Vec<(String, String, String)>, // (encoded_path, display_name, cwd)
+    pub selected: usize,
+}
+
+/// State for the target-agent picker when forking a session. The two options are
+/// the source agent (a native fork) and the other agent (a reconstructed clone).
+pub struct ForkState {
+    pub session: Session,
+    pub options: Vec<crate::session::Agent>,
     pub selected: usize,
 }
 
@@ -259,17 +301,21 @@ pub struct App {
     pub archive_confirm: Option<usize>,
     /// State for the move-to-project picker.
     pub move_state: Option<MoveState>,
+    /// State for the fork target-agent picker.
+    pub fork_state: Option<ForkState>,
     /// Title being edited.
     pub title_edit: Option<TitleEditState>,
-    /// Cached auto-router state from `~/.claude-router`; `None` when no router
-    /// setup is present, in which case the indicator and `^r` toggle are hidden.
-    pub router_enabled: Option<bool>,
-    /// Cached default profile label from `~/.claude-default-profile`.
+    /// Cached default claude profile label from `~/.claude-default-profile`.
     pub profile_label: Option<String>,
 }
 
 impl App {
-    pub fn new(sessions: Vec<Session>, session_index: HashMap<PathBuf, Session>, theme: Theme, grouped_view: bool) -> Self {
+    pub fn new(
+        sessions: Vec<Session>,
+        session_index: HashMap<PathBuf, Session>,
+        theme: Theme,
+        grouped_view: bool,
+    ) -> Self {
         let filtered_indices: Vec<usize> = (0..sessions.len()).collect();
         let display_entries: Vec<DisplayEntry> = filtered_indices
             .iter()
@@ -306,8 +352,8 @@ impl App {
             grouped_view,
             archive_confirm: None,
             move_state: None,
+            fork_state: None,
             title_edit: None,
-            router_enabled: crate::router::router_state(),
             profile_label: crate::router::profile_name(),
         }
     }
@@ -322,11 +368,8 @@ impl App {
 
     /// Build merged display entries from metadata matches and content results.
     pub fn rebuild_display_entries(&mut self) {
-        let content_ids: HashSet<&str> = self
-            .content_results
-            .iter()
-            .map(|s| s.id.as_str())
-            .collect();
+        let content_ids: HashSet<&str> =
+            self.content_results.iter().map(|s| s.id.as_str()).collect();
         let metadata_ids: HashSet<&str> = self
             .filtered_indices
             .iter()
@@ -367,7 +410,8 @@ impl App {
     /// Rebuild project groups and tree rows from current display entries.
     pub fn rebuild_tree_rows(&mut self) {
         let has_filter = !self.filter_query.is_empty();
-        let old_expanded: HashMap<String, bool> = self.project_groups
+        let old_expanded: HashMap<String, bool> = self
+            .project_groups
             .iter()
             .map(|g| (g.path.clone(), g.expanded))
             .collect();
@@ -467,8 +511,14 @@ impl App {
         }
         let entry = &self.display_entries[display_idx];
         let session = self.display_session(entry).clone();
-        let claude_home = get_claude_home();
-        let messages = load_conversation(&claude_home, &session);
+        let messages = match session.agent {
+            crate::session::Agent::Codex => crate::codex::load_codex_conversation(&session),
+            crate::session::Agent::Cursor => crate::cursor::load_cursor_conversation(&session),
+            crate::session::Agent::Claude => {
+                let claude_home = get_claude_home();
+                load_conversation(&claude_home, &session)
+            }
+        };
 
         let initial_search_terms = crate::filter::parse_keywords(&self.filter_query);
 
@@ -506,21 +556,38 @@ impl App {
         let entry = &self.display_entries[display_idx];
         let session = self.display_session(entry).clone();
 
-        let claude_home = get_claude_home();
-        let src = claude_home
-            .join("projects")
-            .join(&session.project_path)
-            .join(format!("{}.jsonl", session.id));
-        let archive_dir = claude_home
-            .join("projects-archive")
-            .join(&session.project_path);
+        match session.agent {
+            crate::session::Agent::Codex => {
+                let source = session
+                    .source_path
+                    .as_deref()
+                    .ok_or("codex session missing source path")?;
+                crate::codex::archive_codex_session(&crate::codex::get_codex_home(), source)?;
+            }
+            crate::session::Agent::Claude => {
+                let claude_home = get_claude_home();
+                let src = claude_home
+                    .join("projects")
+                    .join(&session.project_path)
+                    .join(format!("{}.jsonl", session.id));
+                let archive_dir = claude_home
+                    .join("projects-archive")
+                    .join(&session.project_path);
 
-        std::fs::create_dir_all(&archive_dir)
-            .map_err(|e| format!("failed to create archive dir: {e}"))?;
+                std::fs::create_dir_all(&archive_dir)
+                    .map_err(|e| format!("failed to create archive dir: {e}"))?;
 
-        let dst = archive_dir.join(format!("{}.jsonl", session.id));
-        std::fs::rename(&src, &dst)
-            .map_err(|e| format!("failed to move session: {e}"))?;
+                let dst = archive_dir.join(format!("{}.jsonl", session.id));
+                std::fs::rename(&src, &dst).map_err(|e| format!("failed to move session: {e}"))?;
+            }
+            crate::session::Agent::Cursor => {
+                let source = session
+                    .source_path
+                    .as_deref()
+                    .ok_or("cursor session missing source path")?;
+                crate::cursor::archive_cursor_session(source)?;
+            }
+        }
 
         let label = session.first_message.chars().take(40).collect::<String>();
 
@@ -531,7 +598,8 @@ impl App {
                 }
             }
             DisplaySource::Content(cidx) => {
-                if cidx < self.content_results.len() && self.content_results[cidx].id == session.id {
+                if cidx < self.content_results.len() && self.content_results[cidx].id == session.id
+                {
                     self.content_results.remove(cidx);
                 }
             }
@@ -547,17 +615,29 @@ impl App {
             return;
         }
         let entry = &self.display_entries[display_idx];
-        let current_path = self.display_session(entry).project_path.clone();
+        let move_session = self.display_session(entry);
+        let current_cwd = move_session.cwd.clone();
 
+        // Build the target list keyed by cwd so Claude and Codex projects share
+        // one entry per directory. Prefer a real Claude encoded dir when one
+        // exists at that cwd; otherwise derive it so a Claude source can still
+        // move there. Codex sources only ever need the target cwd.
         let mut seen = HashSet::new();
         let mut projects: Vec<(String, String, String)> = Vec::new();
         for s in &self.sessions {
-            if s.project_path == current_path {
+            if s.cwd == current_cwd || s.cwd.is_empty() {
                 continue;
             }
-            if seen.insert(s.project_path.clone()) {
-                projects.push((s.project_path.clone(), s.project_name.clone(), s.cwd.clone()));
+            if !seen.insert(s.cwd.clone()) {
+                continue;
             }
+            let encoded = self
+                .sessions
+                .iter()
+                .find(|c| c.cwd == s.cwd && c.agent == crate::session::Agent::Claude)
+                .map(|c| c.project_path.clone())
+                .unwrap_or_else(|| encode_claude_dir(&s.cwd));
+            projects.push((encoded, s.project_name.clone(), s.cwd.clone()));
         }
 
         projects.sort_by(|a, b| a.1.to_lowercase().cmp(&b.1.to_lowercase()));
@@ -575,52 +655,107 @@ impl App {
         self.mode = Mode::MoveSelectProject;
     }
 
+    /// Start the fork flow for a given session: pick which agent to fork into.
+    pub fn start_fork(&mut self, display_idx: usize) {
+        if display_idx >= self.display_entries.len() {
+            return;
+        }
+        let entry = &self.display_entries[display_idx];
+        let session = self.display_session(entry).clone();
+        if session.cwd.is_empty() {
+            self.set_status("Cannot fork: session has no working directory".to_string());
+            return;
+        }
+        // Offer the source agent first (a native fork where supported), then the
+        // other two agents (cross-agent reconstruct / context-seed).
+        use crate::session::Agent;
+        let all = [Agent::Claude, Agent::Codex, Agent::Cursor];
+        let mut options = vec![session.agent];
+        options.extend(all.into_iter().filter(|a| *a != session.agent));
+        self.fork_state = Some(ForkState {
+            session,
+            options,
+            selected: 0,
+        });
+        self.mode = Mode::ForkSelectAgent;
+    }
+
     /// Move a session to a different project directory, updating cwd in the JSONL.
-    pub fn move_session(&mut self, display_idx: usize, target_encoded_dir: &str, target_cwd: &str) -> Result<String, String> {
+    pub fn move_session(
+        &mut self,
+        display_idx: usize,
+        target_encoded_dir: &str,
+        target_cwd: &str,
+    ) -> Result<String, String> {
         if display_idx >= self.display_entries.len() {
             return Err("invalid index".to_string());
         }
         let entry = &self.display_entries[display_idx];
         let session = self.display_session(entry).clone();
 
-        let claude_home = get_claude_home();
-        let src = claude_home
-            .join("projects")
-            .join(&session.project_path)
-            .join(format!("{}.jsonl", session.id));
+        match session.agent {
+            crate::session::Agent::Codex => {
+                // Codex rollouts live in date-based dirs, so a "move" just
+                // rewrites the recorded cwd in place; grouping is by cwd.
+                let source = session
+                    .source_path
+                    .as_deref()
+                    .ok_or("codex session missing source path")?;
+                crate::codex::move_codex_session(source, target_cwd)?;
+            }
+            crate::session::Agent::Claude => {
+                let claude_home = get_claude_home();
+                let src = claude_home
+                    .join("projects")
+                    .join(&session.project_path)
+                    .join(format!("{}.jsonl", session.id));
 
-        let dst_dir = claude_home.join("projects").join(target_encoded_dir);
-        std::fs::create_dir_all(&dst_dir)
-            .map_err(|e| format!("failed to create target dir: {e}"))?;
+                let dst_dir = claude_home.join("projects").join(target_encoded_dir);
+                std::fs::create_dir_all(&dst_dir)
+                    .map_err(|e| format!("failed to create target dir: {e}"))?;
 
-        let content = std::fs::read_to_string(&src)
-            .map_err(|e| format!("failed to read session file: {e}"))?;
-        let old_cwd = &session.cwd;
-        let mut updated: String = content
-            .lines()
-            .map(|line| {
-                if let Ok(mut val) = serde_json::from_str::<serde_json::Value>(line) {
-                    if let Some(obj) = val.as_object_mut() {
-                        if obj.get("cwd").and_then(|v| v.as_str()) == Some(old_cwd) {
-                            obj.insert("cwd".to_string(), serde_json::Value::String(target_cwd.to_string()));
+                let content = std::fs::read_to_string(&src)
+                    .map_err(|e| format!("failed to read session file: {e}"))?;
+                let old_cwd = &session.cwd;
+                let mut updated: String = content
+                    .lines()
+                    .map(|line| {
+                        if let Ok(mut val) = serde_json::from_str::<serde_json::Value>(line) {
+                            if let Some(obj) = val.as_object_mut() {
+                                if obj.get("cwd").and_then(|v| v.as_str()) == Some(old_cwd) {
+                                    obj.insert(
+                                        "cwd".to_string(),
+                                        serde_json::Value::String(target_cwd.to_string()),
+                                    );
+                                }
+                            }
+                            serde_json::to_string(&val).unwrap_or_else(|_| line.to_string())
+                        } else {
+                            line.to_string()
                         }
-                    }
-                    serde_json::to_string(&val).unwrap_or_else(|_| line.to_string())
-                } else {
-                    line.to_string()
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                if !updated.is_empty() && !updated.ends_with('\n') {
+                    updated.push('\n');
                 }
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        if !updated.is_empty() && !updated.ends_with('\n') {
-            updated.push('\n');
-        }
 
-        let dst = dst_dir.join(format!("{}.jsonl", session.id));
-        std::fs::write(&dst, &updated)
-            .map_err(|e| format!("failed to write moved session: {e}"))?;
-        std::fs::remove_file(&src)
-            .map_err(|e| format!("failed to remove original session file: {e}"))?;
+                let dst = dst_dir.join(format!("{}.jsonl", session.id));
+                std::fs::write(&dst, &updated)
+                    .map_err(|e| format!("failed to write moved session: {e}"))?;
+                std::fs::remove_file(&src)
+                    .map_err(|e| format!("failed to remove original session file: {e}"))?;
+            }
+            crate::session::Agent::Cursor => {
+                // Cursor derives cwd from the transcript's project dir, so a
+                // "move" relocates the chat's transcript under the target dir.
+                let source = session
+                    .source_path
+                    .as_deref()
+                    .ok_or("cursor session missing source path")?;
+                crate::cursor::move_cursor_session(source, target_cwd)?;
+            }
+        }
 
         let label = session.first_message.chars().take(40).collect::<String>();
         let target_name = std::path::Path::new(target_cwd)
@@ -635,7 +770,8 @@ impl App {
                 }
             }
             DisplaySource::Content(cidx) => {
-                if cidx < self.content_results.len() && self.content_results[cidx].id == session.id {
+                if cidx < self.content_results.len() && self.content_results[cidx].id == session.id
+                {
                     self.content_results.remove(cidx);
                 }
             }
@@ -647,7 +783,8 @@ impl App {
 
     /// Start editing a title for the given session (rename).
     pub fn start_title_edit(&mut self, session_id: String, return_mode: Mode) {
-        let existing = self.find_session(&session_id)
+        let existing = self
+            .find_session(&session_id)
             .and_then(|s| s.custom_title.clone())
             .unwrap_or_default();
         let cursor = existing.len();
@@ -673,7 +810,8 @@ impl App {
 
     /// Start title input for forking a session.
     pub fn start_fork_title(&mut self, session_id: String, cwd: String) {
-        let existing = self.find_session(&session_id)
+        let existing = self
+            .find_session(&session_id)
             .and_then(|s| s.custom_title.clone());
         let prefill = match existing {
             Some(title) => format!("{} (fork)", title),
@@ -697,7 +835,9 @@ impl App {
         match state.context {
             TitleEditContext::Rename { session_id } => {
                 if !title.is_empty() {
-                    let duplicate = self.sessions.iter()
+                    let duplicate = self
+                        .sessions
+                        .iter()
                         .chain(self.content_results.iter())
                         .any(|s| s.id != session_id && s.custom_title.as_deref() == Some(&title));
                     if duplicate {
@@ -713,12 +853,34 @@ impl App {
                     }
                 }
 
-                let project_path = self.find_session(&session_id)
-                    .map(|s| s.project_path.clone())
+                let (project_path, agent) = self
+                    .find_session(&session_id)
+                    .map(|s| (s.project_path.clone(), s.agent))
                     .ok_or("session not found")?;
 
-                crate::titles::save_custom_title(&project_path, &session_id, &title)?;
-                self.update_session_title(&session_id, if title.is_empty() { None } else { Some(title) });
+                match agent {
+                    crate::session::Agent::Codex => {
+                        crate::codex::save_codex_title(
+                            &crate::codex::get_codex_home(),
+                            &session_id,
+                            &title,
+                        )?;
+                    }
+                    crate::session::Agent::Claude => {
+                        crate::titles::save_custom_title(&project_path, &session_id, &title)?;
+                    }
+                    crate::session::Agent::Cursor => {
+                        crate::cursor::save_cursor_title(
+                            &crate::cursor::get_cursor_home(),
+                            &session_id,
+                            &title,
+                        )?;
+                    }
+                }
+                self.update_session_title(
+                    &session_id,
+                    if title.is_empty() { None } else { Some(title) },
+                );
                 self.mode = state.return_mode;
                 Ok(None)
             }
@@ -727,10 +889,15 @@ impl App {
 
                 if title.is_empty() {
                     self.mode = Mode::Browsing;
-                    return Ok(Some(Action::NewSession(format!("cd '{}' && claude", escaped_cwd))));
+                    return Ok(Some(Action::NewSession(format!(
+                        "cd '{}' && claude",
+                        escaped_cwd
+                    ))));
                 }
 
-                let duplicate = self.sessions.iter()
+                let duplicate = self
+                    .sessions
+                    .iter()
                     .chain(self.content_results.iter())
                     .any(|s| s.custom_title.as_deref() == Some(&title));
                 if duplicate {
@@ -747,21 +914,26 @@ impl App {
 
                 let escaped_title = title.replace('\'', "'\\''");
                 self.mode = Mode::Browsing;
-                Ok(Some(Action::NewSession(format!("cd '{}' && claude -n '{}'", escaped_cwd, escaped_title))))
+                Ok(Some(Action::NewSession(format!(
+                    "cd '{}' && claude -n '{}'",
+                    escaped_cwd, escaped_title
+                ))))
             }
             TitleEditContext::Fork { session_id, cwd } => {
                 let escaped_cwd = cwd.replace('\'', "'\\''");
                 if title.is_empty() {
                     self.mode = state.return_mode;
-                    return Ok(Some(Action::ForkSession(
-                        format!("cd '{}' && claude -r {} --fork-session", escaped_cwd, session_id)
-                    )));
+                    return Ok(Some(Action::ForkSession(format!(
+                        "cd '{}' && claude -r {} --fork-session",
+                        escaped_cwd, session_id
+                    ))));
                 }
                 let escaped_title = title.replace('\'', "'\\''");
                 self.mode = state.return_mode;
-                Ok(Some(Action::ForkSession(
-                    format!("cd '{}' && claude -r {} --fork-session -n '{}'", escaped_cwd, session_id, escaped_title)
-                )))
+                Ok(Some(Action::ForkSession(format!(
+                    "cd '{}' && claude -r {} --fork-session -n '{}'",
+                    escaped_cwd, session_id, escaped_title
+                ))))
             }
         }
     }
@@ -775,19 +947,27 @@ impl App {
 
     /// Get the display label for a session: custom_title if set, otherwise first_message.
     pub fn session_display_label(&self, session: &Session) -> String {
-        session.custom_title.clone().unwrap_or_else(|| session.first_message.clone())
+        session
+            .custom_title
+            .clone()
+            .unwrap_or_else(|| session.first_message.clone())
     }
 
     /// Find a session by ID across sessions and content_results.
     fn find_session(&self, session_id: &str) -> Option<&Session> {
-        self.sessions.iter()
+        self.sessions
+            .iter()
             .chain(self.content_results.iter())
             .find(|s| s.id == session_id)
     }
 
     /// Update custom_title on a session in memory.
     fn update_session_title(&mut self, session_id: &str, title: Option<String>) {
-        for s in self.sessions.iter_mut().chain(self.content_results.iter_mut()) {
+        for s in self
+            .sessions
+            .iter_mut()
+            .chain(self.content_results.iter_mut())
+        {
             if s.id == session_id {
                 s.custom_title = title;
                 return;
@@ -890,7 +1070,11 @@ impl App {
 }
 
 /// Run the interactive TUI session picker.
-pub fn run(sessions: Vec<Session>, theme: Theme, grouped_view: bool) -> Result<(), Box<dyn std::error::Error>> {
+pub fn run(
+    sessions: Vec<Session>,
+    theme: Theme,
+    grouped_view: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     if sessions.is_empty() {
         eprintln!("No sessions found.");
         return Ok(());
@@ -938,36 +1122,39 @@ pub fn run(sessions: Vec<Session>, theme: Theme, grouped_view: bool) -> Result<(
                     Action::EnterConversation(idx) => {
                         app.enter_conversation(idx);
                     }
-                    Action::CopyCommand(cmd) | Action::NewSession(cmd) | Action::ForkSession(cmd) => {
+                    Action::CopyCommand(cmd)
+                    | Action::NewSession(cmd)
+                    | Action::ForkSession(cmd)
+                    | Action::CloneSession(cmd) => {
                         deferred_command = Some(cmd);
                         break;
                     }
-                    Action::ArchiveSession(display_idx) => {
-                        match app.archive_session(display_idx) {
-                            Ok(label) => {
-                                app.set_status(format!("Archived: {}", label));
-                                if app.selected >= app.visible_row_count() && app.selected > 0 {
-                                    app.selected -= 1;
-                                }
-                            }
-                            Err(e) => {
-                                app.set_status(format!("Archive failed: {}", e));
+                    Action::ArchiveSession(display_idx) => match app.archive_session(display_idx) {
+                        Ok(label) => {
+                            app.set_status(format!("Archived: {}", label));
+                            if app.selected >= app.visible_row_count() && app.selected > 0 {
+                                app.selected -= 1;
                             }
                         }
-                    }
-                    Action::MoveSession { display_idx, target_project, target_cwd } => {
-                        match app.move_session(display_idx, &target_project, &target_cwd) {
-                            Ok(label) => {
-                                app.set_status(format!("Moved: {}", label));
-                                if app.selected >= app.visible_row_count() && app.selected > 0 {
-                                    app.selected -= 1;
-                                }
-                            }
-                            Err(e) => {
-                                app.set_status(format!("Move failed: {}", e));
+                        Err(e) => {
+                            app.set_status(format!("Archive failed: {}", e));
+                        }
+                    },
+                    Action::MoveSession {
+                        display_idx,
+                        target_project,
+                        target_cwd,
+                    } => match app.move_session(display_idx, &target_project, &target_cwd) {
+                        Ok(label) => {
+                            app.set_status(format!("Moved: {}", label));
+                            if app.selected >= app.visible_row_count() && app.selected > 0 {
+                                app.selected -= 1;
                             }
                         }
-                    }
+                        Err(e) => {
+                            app.set_status(format!("Move failed: {}", e));
+                        }
+                    },
                     Action::BackToList => {
                         app.leave_conversation();
                     }
@@ -984,10 +1171,7 @@ pub fn run(sessions: Vec<Session>, theme: Theme, grouped_view: bool) -> Result<(
     if let Some(cmd) = deferred_command {
         use std::process::Command;
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
-        let status = Command::new(&shell)
-            .arg("-ic")
-            .arg(&cmd)
-            .status();
+        let status = Command::new(&shell).arg("-ic").arg(&cmd).status();
         match status {
             Ok(s) => std::process::exit(s.code().unwrap_or(1)),
             Err(e) => {

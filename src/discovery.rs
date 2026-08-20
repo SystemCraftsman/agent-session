@@ -8,8 +8,8 @@ use chrono::{DateTime, Utc};
 use rayon::prelude::*;
 
 use crate::session::{
-    clean_message, clean_message_multiline, is_meta_message, ConversationMessage, MessageRole,
-    Session, SessionFileEntry,
+    clean_message, clean_message_multiline, is_meta_message, Agent, ConversationMessage,
+    MessageRole, Session, SessionFileEntry,
 };
 
 /// Return the Claude home directory.
@@ -212,6 +212,8 @@ fn parse_session_file(path: &Path) -> Option<Session> {
         cwd,
         project_exists,
         custom_title,
+        agent: Agent::Claude,
+        source_path: None,
     })
 }
 

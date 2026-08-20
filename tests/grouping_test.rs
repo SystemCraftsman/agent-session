@@ -43,8 +43,61 @@ fn group_by_project_correct_session_counts() {
     let group_a = groups.iter().find(|g| g.name == "project-a").unwrap();
     let group_b = groups.iter().find(|g| g.name == "project-b").unwrap();
 
-    assert_eq!(group_a.session_indices.len(), 2, "project-a should have 2 sessions");
-    assert_eq!(group_b.session_indices.len(), 1, "project-b should have 1 session");
+    assert_eq!(
+        group_a.session_indices.len(),
+        2,
+        "project-a should have 2 sessions"
+    );
+    assert_eq!(
+        group_b.session_indices.len(),
+        1,
+        "project-b should have 1 session"
+    );
+}
+
+#[test]
+fn claude_and_codex_in_same_dir_merge_into_one_group() {
+    use cc_session::session::{Agent, Session};
+    use chrono::Utc;
+
+    let cwd = "/Users/test/shared-project";
+    let sessions = vec![
+        Session {
+            id: "claude-1".into(),
+            // Claude keys its project on an encoded dir name...
+            project_path: "-Users-test-shared-project".into(),
+            project_name: "shared-project".into(),
+            git_branch: None,
+            timestamp: Utc::now(),
+            first_message: "claude turn".into(),
+            cwd: cwd.into(),
+            project_exists: false,
+            custom_title: None,
+            agent: Agent::Claude,
+            source_path: None,
+        },
+        Session {
+            id: "codex-1".into(),
+            // ...while Codex keys on the raw cwd; they must still merge.
+            project_path: cwd.into(),
+            project_name: "shared-project".into(),
+            git_branch: None,
+            timestamp: Utc::now(),
+            first_message: "codex turn".into(),
+            cwd: cwd.into(),
+            project_exists: false,
+            custom_title: None,
+            agent: Agent::Codex,
+            source_path: Some("/tmp/rollout.jsonl".into()),
+        },
+    ];
+
+    let entries = make_display_entries(&sessions);
+    let groups = group_by_project(&sessions, &entries);
+
+    assert_eq!(groups.len(), 1, "same cwd should merge across agents");
+    assert_eq!(groups[0].session_indices.len(), 2);
+    assert_eq!(groups[0].name, "shared-project");
 }
 
 #[test]
@@ -54,8 +107,14 @@ fn groups_sorted_by_latest_activity() {
     let groups = group_by_project(&sessions, &entries);
 
     // project-a has newer sessions (2025-02-20) than project-b (2025-02-18)
-    assert_eq!(groups[0].name, "project-a", "newest project should be first");
-    assert_eq!(groups[1].name, "project-b", "older project should be second");
+    assert_eq!(
+        groups[0].name, "project-a",
+        "newest project should be first"
+    );
+    assert_eq!(
+        groups[1].name, "project-b",
+        "older project should be second"
+    );
 }
 
 #[test]
@@ -152,11 +211,23 @@ fn tree_row_equality() {
     assert_eq!(TreeRow::Project(0), TreeRow::Project(0));
     assert_ne!(TreeRow::Project(0), TreeRow::Project(1));
     assert_eq!(
-        TreeRow::Session { project_idx: 0, display_idx: 1 },
-        TreeRow::Session { project_idx: 0, display_idx: 1 }
+        TreeRow::Session {
+            project_idx: 0,
+            display_idx: 1
+        },
+        TreeRow::Session {
+            project_idx: 0,
+            display_idx: 1
+        }
     );
     assert_ne!(
-        TreeRow::Session { project_idx: 0, display_idx: 1 },
-        TreeRow::Session { project_idx: 0, display_idx: 2 }
+        TreeRow::Session {
+            project_idx: 0,
+            display_idx: 1
+        },
+        TreeRow::Session {
+            project_idx: 0,
+            display_idx: 2
+        }
     );
 }

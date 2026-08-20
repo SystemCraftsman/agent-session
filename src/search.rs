@@ -10,7 +10,9 @@ use rayon::prelude::*;
 use regex::Regex;
 
 use crate::filter::parse_keywords;
-use crate::session::{clean_message, Session, SessionFileEntry, strip_system_blocks, strip_tags};
+use crate::session::{
+    clean_message, strip_system_blocks, strip_tags, Agent, Session, SessionFileEntry,
+};
 
 /// Build a file-path-to-session index from discovered sessions.
 ///
@@ -213,7 +215,10 @@ fn file_matches_all(path: &Path, regexes: &[Regex]) -> bool {
 fn extract_entry_type(line: &str) -> &str {
     // Find a safe UTF-8 boundary near 500 bytes
     let max_len = line.len().min(500);
-    let safe_end = (0..=max_len).rev().find(|&i| line.is_char_boundary(i)).unwrap_or(0);
+    let safe_end = (0..=max_len)
+        .rev()
+        .find(|&i| line.is_char_boundary(i))
+        .unwrap_or(0);
     let prefix = &line[..safe_end];
     let needle = "\"type\":\"";
     let mut search_from = 0;
@@ -318,5 +323,7 @@ fn search_file_with_metadata(path: &Path, re: &Regex) -> Option<Session> {
         cwd,
         project_exists,
         custom_title: None,
+        agent: Agent::Claude,
+        source_path: None,
     })
 }
