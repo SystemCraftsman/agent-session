@@ -214,7 +214,7 @@ fn handle_browse(app: &mut App, key: KeyEvent) -> Action {
             }
 
             // Action shortcuts use Ctrl so that bare typing always feeds the
-            // search filter (Agent Sessions' "just start typing" model). Ctrl
+            // search filter (Agent Session's "just start typing" model). Ctrl
             // shortcuts work whether or not the filter is currently active.
             // Move is Ctrl-v because Ctrl-m is indistinguishable from Enter.
             if ctrl && c == 'a' {

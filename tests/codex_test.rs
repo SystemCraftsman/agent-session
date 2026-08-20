@@ -71,7 +71,7 @@ fn resume_command_uses_codex_shell_wrapper() {
         .iter()
         .find(|s| s.id == "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
         .expect("session aaaa present");
-    // Agent Sessions emits a bare `codex`; the user's `codex()` shell function owns
+    // Agent Session emits a bare `codex`; the user's `codex()` shell function owns
     // any wrapping (mirroring the `claude` wrapper).
     assert_eq!(
         s.resume_command(),

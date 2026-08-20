@@ -1,16 +1,16 @@
-# Agent Sessions
+# Agent Session
 
 A fast terminal UI for browsing, searching, replaying, forking, and transferring your AI coding sessions across **Claude Code**, **Codex CLI**, and **Cursor CLI**, all from one place.
 
 ## Overview
 
-Every coding agent stores its own conversation history in its own format and its own directory. Agent Sessions reads all of them, merges the sessions into a single searchable list, and lets you jump back into any of them with one keypress. It also lets you carry a conversation from one agent into another, so work you started in Claude can continue in Codex or Cursor.
+Every coding agent stores its own conversation history in its own format and its own directory. Agent Session reads all of them, merges the sessions into a single searchable list, and lets you jump back into any of them with one keypress. It also lets you carry a conversation from one agent into another, so work you started in Claude can continue in Codex or Cursor.
 
 Built in Rust for instant startup, it discovers and renders thousands of sessions in well under a second by parsing transcripts in parallel.
 
 ## Supported Agents
 
-Agent Sessions discovers sessions from all three agents automatically and tags each one with a colored badge in the list.
+Agent Session discovers sessions from all three agents automatically and tags each one with a colored badge in the list.
 
 | Agent  | Source directory        | Resume mechanism                          |
 |--------|-------------------------|-------------------------------------------|
@@ -36,7 +36,7 @@ Press Enter on a session to open the conversation viewer, which renders the full
 
 ### Cross-Agent Transfer And Fork
 
-This is what sets Agent Sessions apart from a single-agent history viewer. From the fork picker you can clone any session into any of the three agents:
+This is what sets Agent Session apart from a single-agent history viewer. From the fork picker you can clone any session into any of the three agents:
 
 - **Claude and Codex targets** are reconstructed into a real, native session file that the target's own CLI can resume directly.
 - **Cursor targets** are context-seeded: because Cursor resumes from its own cloud, the source transcript is written to an import file and a fresh `cursor-agent` chat is launched pre-instructed to read it and continue.
@@ -114,7 +114,7 @@ The session list and the conversation viewer each have their own bindings.
 
 ## Storage Locations
 
-Agent Sessions reads each agent's own history and keeps its small amount of extra state in the agent home directories.
+Agent Session reads each agent's own history and keeps its small amount of extra state in the agent home directories.
 
 | Path                                          | Purpose                                  |
 |-----------------------------------------------|------------------------------------------|
