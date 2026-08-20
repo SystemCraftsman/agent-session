@@ -1,10 +1,10 @@
-# cc-session Development Guidelines
+# Agent Session Development Guidelines
 
 ## Tech Stack
 - Rust (stable, 2021 edition, MSRV 1.80.0)
 - ratatui 0.30, crossterm 0.29, clap 4.5, syntect 5.3, termbg 0.6
-- rayon 1.11, regex 1, serde/serde_json 1.0, chrono 0.4, arboard 3.6
-- Read-only access to `~/.claude/projects/**/*.jsonl`
+- rayon 1.11, regex 1, serde/serde_json 1.0, chrono 0.4
+- Reads Claude, Codex, and Cursor session directories
 
 ## Commands
 
@@ -51,5 +51,5 @@ Keep entries concise. Group by: "What's New" for features/improvements, "Bug Fix
 ### Important
 
 - Do NOT create GH releases manually (cargo-dist CI creates them)
-- Homebrew tap at cc-deck/tap updates automatically
+- Releases ship the shell installer + GitHub Release binaries only (no Homebrew tap configured yet)
 - GPG signing can timeout; use `-c commit.gpgsign=false` or `-c tag.gpgsign=false` if needed

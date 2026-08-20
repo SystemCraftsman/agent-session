@@ -1,6 +1,6 @@
 [package]
 name = "agent-session"
-version = "0.7.5"
+version = "0.1.0"
 edition = "2021"
 rust-version = "1.80.0"
 description = "Fast TUI for browsing, forking, and transferring AI coding sessions across Claude, Codex, and Cursor"
