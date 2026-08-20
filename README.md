@@ -80,15 +80,19 @@ The session list and the conversation viewer each have their own bindings.
 
 ### Session List
 
+Action shortcuts use a `Ctrl` prefix so that plain typing always goes to the seamless search filter.
+
 | Key                 | Action                                         |
 |---------------------|------------------------------------------------|
 | `Down` / `Up`       | Move the cursor                                |
 | Type any text       | Filter sessions (seamless search)              |
 | `Enter`             | Open the selected session's conversation       |
-| `t`                 | Rename the selected session (custom title)     |
-| `a`                 | Archive the selected session                   |
-| `m`                 | Move the session to another project            |
-| `f`                 | Fork or transfer the session to another agent  |
+| `Tab`               | Toggle flat / grouped-by-project view          |
+| `Ctrl-t`            | Rename the selected session (custom title)     |
+| `Ctrl-n`            | Start a new session in the selected project    |
+| `Ctrl-a`            | Archive the selected session                   |
+| `Ctrl-v`            | Move the session to another project            |
+| `Ctrl-f`            | Fork or transfer the session to another agent  |
 | `Esc`               | Clear the filter, then quit                    |
 | `Ctrl-C`            | Quit                                           |
 
