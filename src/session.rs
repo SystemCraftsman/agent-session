@@ -14,6 +14,17 @@ pub enum Agent {
     Cursor,
 }
 
+impl Agent {
+    /// Human-readable agent name (`Claude`, `Codex`, `Cursor`).
+    pub fn label(self) -> &'static str {
+        match self {
+            Agent::Claude => "Claude",
+            Agent::Codex => "Codex",
+            Agent::Cursor => "Cursor",
+        }
+    }
+}
+
 /// A discovered agent session (Claude, Codex or Cursor) with metadata.
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
@@ -64,6 +75,46 @@ impl Session {
             Agent::Cursor => {
                 format!("cd '{}' && cursor-agent --resume {}", escaped_cwd, self.id)
             }
+        }
+    }
+
+    /// Like [`Session::resume_command`], but for a Claude session substitutes
+    /// `claude` with the given launcher (either `claude` or a
+    /// `_claude_run_<profile>` shell function) so the session resumes under its
+    /// tagged profile. Non-Claude agents ignore the launcher.
+    pub fn resume_command_with(&self, claude_launcher: &str) -> String {
+        if self.agent != Agent::Claude {
+            return self.resume_command();
+        }
+        let escaped_cwd = self.cwd.replace('\'', "'\\''");
+        match &self.custom_title {
+            Some(title) if !title.is_empty() => {
+                let escaped_title = title.replace('\'', "'\\''");
+                format!(
+                    "cd '{}' && {} -r {} -n '{}'",
+                    escaped_cwd, claude_launcher, self.id, escaped_title
+                )
+            }
+            _ => format!("cd '{}' && {} -r {}", escaped_cwd, claude_launcher, self.id),
+        }
+    }
+
+    /// Short human label for a terminal tab title, prefixed with the owning
+    /// agent, e.g. `Codex: Refactor the payment module`. Uses the custom title
+    /// when set, otherwise the first message, truncated to a sensible width.
+    pub fn title_label(&self) -> String {
+        let base = self
+            .custom_title
+            .as_deref()
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .unwrap_or_else(|| self.first_message.trim());
+        let truncated: String = base.chars().take(60).collect();
+        let truncated = truncated.trim();
+        if truncated.is_empty() {
+            format!("{} session", self.agent.label())
+        } else {
+            format!("{}: {}", self.agent.label(), truncated)
         }
     }
 }
@@ -359,4 +410,51 @@ pub struct HistoryEntry {
     pub display: String,
     pub timestamp: i64,
     pub project: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn session(agent: Agent, custom: Option<&str>, first: &str) -> Session {
+        Session {
+            id: "id".to_string(),
+            project_path: "/tmp/proj".to_string(),
+            project_name: "proj".to_string(),
+            git_branch: None,
+            timestamp: Utc::now(),
+            first_message: first.to_string(),
+            cwd: "/tmp/proj".to_string(),
+            project_exists: true,
+            custom_title: custom.map(str::to_string),
+            agent,
+            source_path: None,
+        }
+    }
+
+    #[test]
+    fn title_label_prefers_custom_title_and_prefixes_agent() {
+        let s = session(Agent::Codex, Some("Refactor payments"), "ignored first message");
+        assert_eq!(s.title_label(), "Codex: Refactor payments");
+    }
+
+    #[test]
+    fn title_label_falls_back_to_first_message() {
+        let s = session(Agent::Claude, None, "  Fix the flaky test  ");
+        assert_eq!(s.title_label(), "Claude: Fix the flaky test");
+    }
+
+    #[test]
+    fn title_label_truncates_long_text_to_60_chars() {
+        let long = "x".repeat(200);
+        let s = session(Agent::Cursor, None, &long);
+        let expected = format!("Cursor: {}", "x".repeat(60));
+        assert_eq!(s.title_label(), expected);
+    }
+
+    #[test]
+    fn title_label_handles_empty_text() {
+        let s = session(Agent::Cursor, Some("   "), "");
+        assert_eq!(s.title_label(), "Cursor session");
+    }
 }

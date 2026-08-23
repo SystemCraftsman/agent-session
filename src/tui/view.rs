@@ -20,6 +20,23 @@ fn agent_badge(agent: Agent) -> (&'static str, Color) {
     }
 }
 
+/// Return the per-session profile badge (with trailing space) and its color for
+/// a Claude session tagged with a work/personal profile. Returns an empty marker
+/// for untagged or non-Claude sessions, so nothing is drawn for them.
+fn profile_badge(
+    session: &crate::session::Session,
+    profiles: &std::collections::HashMap<String, String>,
+) -> (String, Color) {
+    if session.agent != Agent::Claude {
+        return (String::new(), Color::Reset);
+    }
+    match profiles.get(&session.id).map(String::as_str) {
+        Some("work") => ("[work] ".to_string(), Color::Green),
+        Some("personal") => ("[personal] ".to_string(), Color::Yellow),
+        _ => (String::new(), Color::Reset),
+    }
+}
+
 /// Render the full TUI frame.
 pub fn render(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
@@ -45,6 +62,9 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     }
     if app.mode == Mode::ForkSelectAgent {
         render_fork_picker(frame, app, area);
+    }
+    if app.mode == Mode::ProfileSelect {
+        render_profile_picker(frame, app, area);
     }
 }
 
@@ -88,12 +108,16 @@ fn render_flat_session_list(frame: &mut Frame, app: &App, area: Rect) {
 
         let (agent_tag, agent_color) = agent_badge(session.agent);
         let agent_tag_len = agent_tag.chars().count();
+        let (prof_tag, prof_color) = profile_badge(session, &app.session_profiles);
+        let prof_len = prof_tag.chars().count();
 
         let label = app.session_display_label(session);
-        let max_msg_len = width.saturating_sub(cursor_len + agent_tag_len + right_len + 2);
+        let max_msg_len =
+            width.saturating_sub(cursor_len + agent_tag_len + prof_len + right_len + 2);
         let msg = truncate_str(&label, max_msg_len);
         let msg_len = msg.chars().count();
-        let pad = width.saturating_sub(cursor_len + agent_tag_len + msg_len + right_len);
+        let pad =
+            width.saturating_sub(cursor_len + agent_tag_len + prof_len + msg_len + right_len);
         let padding = " ".repeat(pad);
 
         let msg_style = if is_selected {
@@ -107,6 +131,9 @@ fn render_flat_session_list(frame: &mut Frame, app: &App, area: Rect) {
 
         let mut spans = vec![Span::styled(cursor, cursor_style)];
         spans.push(Span::styled(agent_tag, Style::default().fg(agent_color)));
+        if !prof_tag.is_empty() {
+            spans.push(Span::styled(prof_tag, Style::default().fg(prof_color)));
+        }
         spans.extend(highlight_terms(&msg, &term_refs, msg_style, &app.theme));
         spans.push(Span::raw(padding));
         spans.push(Span::styled(right, dim));
@@ -126,7 +153,8 @@ fn render_flat_session_list(frame: &mut Frame, app: &App, area: Rect) {
         .borders(Borders::ALL)
         .border_style(border_style)
         .title(format!(
-            " Agent Session ({}/{}) ",
+            " Agent Session{} ({}/{}) ",
+            if app.viewing_archived { " [ARCHIVED]" } else { "" },
             app.display_entries.len(),
             app.sessions.len()
         ))
@@ -223,14 +251,18 @@ fn render_grouped_session_list(frame: &mut Frame, app: &App, area: Rect) {
 
                 let (agent_tag, agent_color) = agent_badge(session.agent);
                 let agent_tag_len = agent_tag.chars().count();
+                let (prof_tag, prof_color) = profile_badge(session, &app.session_profiles);
+                let prof_len = prof_tag.chars().count();
 
                 let label = app.session_display_label(session);
-                let max_msg_len =
-                    width.saturating_sub(indent_len + cursor_len + agent_tag_len + right_len + 2);
+                let max_msg_len = width.saturating_sub(
+                    indent_len + cursor_len + agent_tag_len + prof_len + right_len + 2,
+                );
                 let msg = truncate_str(&label, max_msg_len);
                 let msg_len = msg.chars().count();
-                let pad = width
-                    .saturating_sub(indent_len + cursor_len + agent_tag_len + msg_len + right_len);
+                let pad = width.saturating_sub(
+                    indent_len + cursor_len + agent_tag_len + prof_len + msg_len + right_len,
+                );
                 let padding = " ".repeat(pad);
 
                 let msg_style = if is_selected {
@@ -244,6 +276,9 @@ fn render_grouped_session_list(frame: &mut Frame, app: &App, area: Rect) {
 
                 let mut spans = vec![Span::raw(indent), Span::styled(cursor, cursor_style)];
                 spans.push(Span::styled(agent_tag, Style::default().fg(agent_color)));
+                if !prof_tag.is_empty() {
+                    spans.push(Span::styled(prof_tag, Style::default().fg(prof_color)));
+                }
                 spans.extend(highlight_terms(&msg, &term_refs, msg_style, &app.theme));
                 spans.push(Span::raw(padding));
                 spans.push(Span::styled(right, dim));
@@ -270,7 +305,8 @@ fn render_grouped_session_list(frame: &mut Frame, app: &App, area: Rect) {
         .borders(Borders::ALL)
         .border_style(border_style)
         .title(format!(
-            " Agent Session ({}/{}) \u{2500} {} projects ",
+            " Agent Session{} ({}/{}) \u{2500} {} projects ",
+            if app.viewing_archived { " [ARCHIVED]" } else { "" },
             session_count,
             app.sessions.len(),
             app.project_groups.len(),
@@ -431,6 +467,64 @@ fn render_fork_picker(frame: &mut Frame, app: &App, area: Rect) {
         .borders(Borders::ALL)
         .border_style(Style::default().fg(app.theme.cursor_color))
         .title(" Fork to agent ")
+        .title_style(Style::default().fg(app.theme.cursor_color).bold());
+
+    let paragraph = Paragraph::new(Text::from(lines)).block(block);
+    frame.render_widget(paragraph, popup_area);
+}
+
+/// Render the per-session Claude profile picker (work / personal / clear).
+fn render_profile_picker(frame: &mut Frame, app: &App, area: Rect) {
+    let state = match &app.profile_state {
+        Some(s) => s,
+        None => return,
+    };
+
+    let max_w = 44u16.min(area.width.saturating_sub(4)).max(20);
+    let max_h = (state.options.len() as u16 + 2)
+        .min(area.height.saturating_sub(4))
+        .max(4);
+    let x = (area.width.saturating_sub(max_w)) / 2;
+    let y = (area.height.saturating_sub(max_h)) / 2;
+    let popup_area = Rect::new(x, y, max_w, max_h);
+
+    frame.render_widget(ratatui::widgets::Clear, popup_area);
+
+    let inner_w = max_w.saturating_sub(2) as usize;
+    let mut lines: Vec<Line> = Vec::new();
+    for (i, option) in state.options.iter().enumerate() {
+        let is_sel = i == state.selected;
+        let (prefix, style) = if is_sel {
+            (
+                "\u{27A4} ",
+                Style::default().fg(app.theme.cursor_color).bold(),
+            )
+        } else {
+            ("  ", Style::default().fg(app.theme.text))
+        };
+        let label = match option.as_deref() {
+            Some("work") => "work".to_string(),
+            Some("personal") => "personal".to_string(),
+            Some(other) => other.to_string(),
+            None => "clear (use default)".to_string(),
+        };
+        let pad = inner_w.saturating_sub(prefix.chars().count() + label.chars().count());
+        let line = Line::from(vec![
+            Span::styled(prefix, style),
+            Span::styled(label, style),
+            Span::raw(" ".repeat(pad)),
+        ]);
+        if is_sel {
+            lines.push(line.patch_style(Style::default().bg(app.theme.selected_bg)));
+        } else {
+            lines.push(line);
+        }
+    }
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(app.theme.cursor_color))
+        .title(" Session profile ")
         .title_style(Style::default().fg(app.theme.cursor_color).bold());
 
     let paragraph = Paragraph::new(Text::from(lines)).block(block);
@@ -1108,6 +1202,21 @@ fn render_status_bar(frame: &mut Frame, app: &App, area: Rect) {
                 Span::styled(" cancel", dim),
             ])
         }
+        Mode::ProfileSelect => {
+            let key_style = Style::default().fg(Color::White).bold();
+            Line::from(vec![
+                Span::styled(
+                    " Set session profile: ",
+                    Style::default().fg(app.theme.cursor_color).bold(),
+                ),
+                Span::styled("↑↓", key_style),
+                Span::styled(" navigate  ", dim),
+                Span::styled("Enter", key_style),
+                Span::styled(" confirm  ", dim),
+                Span::styled("Esc", key_style),
+                Span::styled(" cancel", dim),
+            ])
+        }
         Mode::ConfirmArchive | Mode::Browsing => {
             if app.archive_confirm.is_some() {
                 let warn_style = Style::default().fg(Color::Yellow).bold();
@@ -1172,32 +1281,59 @@ fn render_status_bar(frame: &mut Frame, app: &App, area: Rect) {
                     ));
                     spans.push(Span::raw("  "));
                 }
-                spans.extend([
-                    Span::styled(" Enter ", dim),
-                    Span::styled("detail", dim),
-                    Span::raw("  "),
-                    Span::styled("^t ", dim),
-                    Span::styled("title", dim),
-                    Span::raw("  "),
-                    Span::styled("^n ", dim),
-                    Span::styled("new", dim),
-                    Span::raw("  "),
-                    Span::styled("^a ", dim),
-                    Span::styled("archive", dim),
-                    Span::raw("  "),
-                    Span::styled("^v ", dim),
-                    Span::styled("move", dim),
-                    Span::raw("  "),
-                    Span::styled("^f ", dim),
-                    Span::styled("fork", dim),
-                    Span::raw("  "),
-                    Span::styled("Esc ", dim),
-                    Span::styled("quit", dim),
-                    Span::raw("  "),
-                    Span::styled(view_hint, dim),
-                    Span::raw("  "),
-                    Span::styled("(type to search)", dim),
-                ]);
+                if app.viewing_archived {
+                    // Archive view is read-only apart from restore.
+                    spans.extend([
+                        Span::styled(" Enter ", dim),
+                        Span::styled("detail", dim),
+                        Span::raw("  "),
+                        Span::styled("^u ", dim),
+                        Span::styled("restore", dim),
+                        Span::raw("  "),
+                        Span::styled("^r ", dim),
+                        Span::styled("active", dim),
+                        Span::raw("  "),
+                        Span::styled("Esc ", dim),
+                        Span::styled("quit", dim),
+                        Span::raw("  "),
+                        Span::styled(view_hint, dim),
+                        Span::raw("  "),
+                        Span::styled("(type to search)", dim),
+                    ]);
+                } else {
+                    spans.extend([
+                        Span::styled(" Enter ", dim),
+                        Span::styled("detail", dim),
+                        Span::raw("  "),
+                        Span::styled("^t ", dim),
+                        Span::styled("title", dim),
+                        Span::raw("  "),
+                        Span::styled("^n ", dim),
+                        Span::styled("new", dim),
+                        Span::raw("  "),
+                        Span::styled("^a ", dim),
+                        Span::styled("archive", dim),
+                        Span::raw("  "),
+                        Span::styled("^v ", dim),
+                        Span::styled("move", dim),
+                        Span::raw("  "),
+                        Span::styled("^f ", dim),
+                        Span::styled("fork", dim),
+                        Span::raw("  "),
+                        Span::styled("^p ", dim),
+                        Span::styled("profile", dim),
+                        Span::raw("  "),
+                        Span::styled("^r ", dim),
+                        Span::styled("archived", dim),
+                        Span::raw("  "),
+                        Span::styled("Esc ", dim),
+                        Span::styled("quit", dim),
+                        Span::raw("  "),
+                        Span::styled(view_hint, dim),
+                        Span::raw("  "),
+                        Span::styled("(type to search)", dim),
+                    ]);
+                }
                 Line::from(spans)
             }
         }

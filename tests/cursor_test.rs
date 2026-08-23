@@ -1,7 +1,10 @@
 use std::path::Path;
 
 use agent_session::convert::clone_to_other_agent;
-use agent_session::cursor::{discover_cursor_sessions, encode_cursor_dir, load_cursor_conversation};
+use agent_session::cursor::{
+    archive_cursor_session, discover_archived_cursor_sessions, discover_cursor_sessions,
+    encode_cursor_dir, load_cursor_conversation, restore_cursor_session,
+};
 use agent_session::discovery::load_conversation;
 use agent_session::session::{Agent, MessageRole, Session};
 
@@ -95,6 +98,72 @@ fn discovers_and_loads_cursor_transcript() {
 
 #[test]
 #[serial]
+fn archived_cursor_session_is_discoverable_and_restorable() {
+    let cursor_home = tempfile::tempdir().unwrap();
+    std::env::set_var("CURSOR_HOME", cursor_home.path());
+
+    let chat_id = "ffffffff-0000-1111-2222-333333333333";
+    let source = write_cursor_source(cursor_home.path(), CURSOR_CWD, chat_id);
+    let src_path = source.source_path.clone().expect("cursor source path");
+
+    archive_cursor_session(&src_path).unwrap();
+    assert!(discover_cursor_sessions(cursor_home.path()).is_empty());
+
+    let archived = discover_archived_cursor_sessions(cursor_home.path());
+    assert_eq!(archived.len(), 1);
+    let archived_src = archived[0].source_path.clone().expect("archived source path");
+
+    restore_cursor_session(&archived_src).unwrap();
+    assert!(discover_archived_cursor_sessions(cursor_home.path()).is_empty());
+    let restored = discover_cursor_sessions(cursor_home.path());
+    assert_eq!(restored.len(), 1);
+    assert_eq!(restored[0].id, chat_id);
+
+    std::env::remove_var("CURSOR_HOME");
+    let _ = std::fs::remove_dir_all(CURSOR_CWD);
+}
+
+#[test]
+#[serial]
+fn archiving_over_a_stale_archived_stub_disambiguates_instead_of_failing() {
+    let cursor_home = tempfile::tempdir().unwrap();
+    std::env::set_var("CURSOR_HOME", cursor_home.path());
+
+    let chat_id = "cccccccc-1111-2222-3333-444444444444";
+    let source = write_cursor_source(cursor_home.path(), CURSOR_CWD, chat_id);
+    let src_path = source.source_path.clone().expect("cursor source path");
+
+    // Pre-seed a stale, non-empty archived directory occupying the same chat id
+    // (the case that used to fail with "directory not empty").
+    let archive_root = cursor_home
+        .path()
+        .join("projects")
+        .join(encode_cursor_dir(CURSOR_CWD))
+        .join("agent-transcripts-archive");
+    let stale = archive_root.join(chat_id);
+    std::fs::create_dir_all(&stale).unwrap();
+    std::fs::write(stale.join(format!("{chat_id}.jsonl")), "stale\n").unwrap();
+
+    // Archiving must succeed (no "directory not empty") without clobbering the
+    // stale stub: the real session lands in a disambiguated `<id>-2` directory
+    // whose inner transcript is renamed to match, so discovery still finds it.
+    archive_cursor_session(&src_path).unwrap();
+    assert!(discover_cursor_sessions(cursor_home.path()).is_empty());
+    assert!(stale.exists(), "stale archived stub must be preserved");
+    let disambiguated = archive_root.join(format!("{chat_id}-2"));
+    assert!(disambiguated.exists(), "new archive lands in <id>-2");
+    assert!(disambiguated
+        .join(format!("{chat_id}-2.jsonl"))
+        .exists());
+    let archived = discover_archived_cursor_sessions(cursor_home.path());
+    assert_eq!(archived.len(), 1, "the real session is discoverable");
+
+    std::env::remove_var("CURSOR_HOME");
+    let _ = std::fs::remove_dir_all(CURSOR_CWD);
+}
+
+#[test]
+#[serial]
 fn reconstructs_cursor_session_into_native_claude() {
     let cursor_home = tempfile::tempdir().unwrap();
     let claude_home = tempfile::tempdir().unwrap();
@@ -171,8 +240,9 @@ fn seeds_new_cursor_chat_from_claude() {
     assert!(doc.contains("Refactor the payment module."));
     assert!(doc.contains("Done, all tests pass."));
     assert!(doc.contains("from Claude"));
-    // The labeled title is embedded in the import doc for context.
-    assert!(doc.contains("Refactor the payment module. (reconstruct)"));
+    // The labeled title is embedded in the import doc for context. A Cursor
+    // target is context-seeded, so a cross-agent copy carries a "(seed)" suffix.
+    assert!(doc.contains("Refactor the payment module. (seed)"));
 
     std::env::remove_var("CLAUDE_HOME");
     std::env::remove_var("CURSOR_HOME");

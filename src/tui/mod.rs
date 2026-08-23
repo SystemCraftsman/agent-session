@@ -35,6 +35,7 @@ pub enum Mode {
     ConfirmArchive,
     MoveSelectProject,
     ForkSelectAgent,
+    ProfileSelect,
     TitleEdit,
 }
 
@@ -76,10 +77,10 @@ pub enum Action {
     Continue,
     Quit,
     EnterConversation(usize),
-    CopyCommand(String),
-    NewSession(String),
-    ForkSession(String),
-    CloneSession(String),
+    CopyCommand { cmd: String, title: Option<String> },
+    NewSession { cmd: String, title: Option<String> },
+    ForkSession { cmd: String, title: Option<String> },
+    CloneSession { cmd: String, title: Option<String> },
     BackToList,
     ArchiveSession(usize),
     MoveSession {
@@ -225,6 +226,15 @@ pub struct ForkState {
     pub selected: usize,
 }
 
+/// State for the per-session profile picker (Claude sessions only). Each option
+/// is a profile to set, or `None` for the "clear tag" choice (fall back to the
+/// global default).
+pub struct ProfileState {
+    pub session_id: String,
+    pub options: Vec<Option<String>>,
+    pub selected: usize,
+}
+
 /// What the title edit is for.
 pub enum TitleEditContext {
     Rename { session_id: String },
@@ -307,6 +317,14 @@ pub struct App {
     pub title_edit: Option<TitleEditState>,
     /// Cached default claude profile label from `~/.claude-default-profile`.
     pub profile_label: Option<String>,
+    /// State for the per-session profile picker.
+    pub profile_state: Option<ProfileState>,
+    /// Per-session profile tags (session id -> profile), loaded from the sidecar.
+    pub session_profiles: HashMap<String, String>,
+    /// When true, the list shows archived sessions (from the `*-archive`
+    /// directories) instead of the live ones, and the only session action is
+    /// restore.
+    pub viewing_archived: bool,
 }
 
 impl App {
@@ -355,6 +373,9 @@ impl App {
             fork_state: None,
             title_edit: None,
             profile_label: crate::router::profile_name(),
+            profile_state: None,
+            session_profiles: crate::router::load_session_profiles(&get_claude_home()),
+            viewing_archived: false,
         }
     }
 
@@ -609,6 +630,108 @@ impl App {
         Ok(label)
     }
 
+    /// Toggle between the live session list and the archived list, reloading
+    /// sessions from the corresponding directories.
+    pub fn toggle_archived(&mut self) {
+        self.viewing_archived = !self.viewing_archived;
+        self.reload_sessions();
+        if self.viewing_archived {
+            self.set_status("Archived sessions (^r back, ^u restore)".to_string());
+        } else {
+            self.set_status("Active sessions".to_string());
+        }
+    }
+
+    /// Reload `self.sessions` from either the live or archived directories
+    /// (per `viewing_archived`), clearing any active search/filter first.
+    fn reload_sessions(&mut self) {
+        self.cancel_content_search();
+        self.filter_query.clear();
+        self.filter_active = false;
+
+        let claude_home = get_claude_home();
+        let codex_home = crate::codex::get_codex_home();
+        let cursor_home = crate::cursor::get_cursor_home();
+
+        let mut sessions = if self.viewing_archived {
+            let mut s = crate::discovery::discover_archived_sessions(&claude_home);
+            s.extend(crate::codex::discover_archived_codex_sessions(&codex_home));
+            s.extend(crate::cursor::discover_archived_cursor_sessions(&cursor_home));
+            s
+        } else {
+            let mut s = crate::discovery::discover_sessions(&claude_home);
+            s.extend(crate::codex::discover_codex_sessions(&codex_home));
+            s.extend(crate::cursor::discover_cursor_sessions(&cursor_home));
+            s
+        };
+        sessions.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+        self.sessions = sessions;
+        self.apply_filter();
+    }
+
+    /// Restore an archived session by moving its file(s) back to the live
+    /// directory. Returns Ok(session_name) on success. Mirrors
+    /// [`App::archive_session`] in reverse.
+    pub fn restore_session(&mut self, display_idx: usize) -> Result<String, String> {
+        if display_idx >= self.display_entries.len() {
+            return Err("invalid index".to_string());
+        }
+        let entry = &self.display_entries[display_idx];
+        let session = self.display_session(entry).clone();
+        let entry_source = entry.source.clone();
+
+        match session.agent {
+            crate::session::Agent::Codex => {
+                let source = session
+                    .source_path
+                    .as_deref()
+                    .ok_or("codex session missing source path")?;
+                crate::codex::restore_codex_session(&crate::codex::get_codex_home(), source)?;
+            }
+            crate::session::Agent::Claude => {
+                let claude_home = get_claude_home();
+                let src = claude_home
+                    .join("projects-archive")
+                    .join(&session.project_path)
+                    .join(format!("{}.jsonl", session.id));
+                let live_dir = claude_home.join("projects").join(&session.project_path);
+
+                std::fs::create_dir_all(&live_dir)
+                    .map_err(|e| format!("failed to create projects dir: {e}"))?;
+
+                let dst = live_dir.join(format!("{}.jsonl", session.id));
+                std::fs::rename(&src, &dst)
+                    .map_err(|e| format!("failed to restore session: {e}"))?;
+            }
+            crate::session::Agent::Cursor => {
+                let source = session
+                    .source_path
+                    .as_deref()
+                    .ok_or("cursor session missing source path")?;
+                crate::cursor::restore_cursor_session(source)?;
+            }
+        }
+
+        let label = session.first_message.chars().take(40).collect::<String>();
+
+        match entry_source {
+            DisplaySource::Sessions(sidx) => {
+                if sidx < self.sessions.len() && self.sessions[sidx].id == session.id {
+                    self.sessions.remove(sidx);
+                }
+            }
+            DisplaySource::Content(cidx) => {
+                if cidx < self.content_results.len() && self.content_results[cidx].id == session.id
+                {
+                    self.content_results.remove(cidx);
+                }
+            }
+        }
+        self.apply_filter();
+
+        Ok(label)
+    }
+
     /// Start the move-to-project flow for a given session.
     pub fn start_move(&mut self, display_idx: usize) {
         if display_idx >= self.display_entries.len() {
@@ -678,6 +801,60 @@ impl App {
             selected: 0,
         });
         self.mode = Mode::ForkSelectAgent;
+    }
+
+    /// Start the per-session profile picker for the selected Claude session.
+    pub fn start_profile(&mut self, display_idx: usize) {
+        if display_idx >= self.display_entries.len() {
+            return;
+        }
+        let entry = &self.display_entries[display_idx];
+        let session = self.display_session(entry);
+        if session.agent != crate::session::Agent::Claude {
+            self.set_status("Profiles apply to Claude sessions only".to_string());
+            return;
+        }
+        let session_id = session.id.clone();
+        let current = self.session_profiles.get(&session_id).cloned();
+        let mut options: Vec<Option<String>> = crate::router::PROFILES
+            .iter()
+            .map(|p| Some(p.to_string()))
+            .collect();
+        options.push(None); // "clear" choice
+        let selected = current
+            .as_deref()
+            .and_then(|p| options.iter().position(|o| o.as_deref() == Some(p)))
+            .unwrap_or(0);
+        self.profile_state = Some(ProfileState {
+            session_id,
+            options,
+            selected,
+        });
+        self.mode = Mode::ProfileSelect;
+    }
+
+    /// Persist the picked profile for the session and update the in-memory tag.
+    pub fn apply_profile(&mut self) {
+        let Some(state) = self.profile_state.take() else {
+            return;
+        };
+        self.mode = Mode::Browsing;
+        let choice = state.options.get(state.selected).cloned().flatten();
+        let claude_home = get_claude_home();
+        let value = choice.as_deref().unwrap_or("");
+        match crate::router::save_session_profile(&claude_home, &state.session_id, value) {
+            Ok(()) => match &choice {
+                Some(p) => {
+                    self.session_profiles.insert(state.session_id, p.clone());
+                    self.set_status(format!("Profile set to {p}"));
+                }
+                None => {
+                    self.session_profiles.remove(&state.session_id);
+                    self.set_status("Profile cleared (uses default)".to_string());
+                }
+            },
+            Err(e) => self.set_status(format!("Failed to set profile: {e}")),
+        }
     }
 
     /// Move a session to a different project directory, updating cwd in the JSONL.
@@ -889,10 +1066,10 @@ impl App {
 
                 if title.is_empty() {
                     self.mode = Mode::Browsing;
-                    return Ok(Some(Action::NewSession(format!(
-                        "cd '{}' && claude",
-                        escaped_cwd
-                    ))));
+                    return Ok(Some(Action::NewSession {
+                        cmd: format!("cd '{}' && claude", escaped_cwd),
+                        title: None,
+                    }));
                 }
 
                 let duplicate = self
@@ -914,26 +1091,36 @@ impl App {
 
                 let escaped_title = title.replace('\'', "'\\''");
                 self.mode = Mode::Browsing;
-                Ok(Some(Action::NewSession(format!(
-                    "cd '{}' && claude -n '{}'",
-                    escaped_cwd, escaped_title
-                ))))
+                Ok(Some(Action::NewSession {
+                    cmd: format!("cd '{}' && claude -n '{}'", escaped_cwd, escaped_title),
+                    title: Some(format!("Claude: {title}")),
+                }))
             }
             TitleEditContext::Fork { session_id, cwd } => {
                 let escaped_cwd = cwd.replace('\'', "'\\''");
+                let launcher = crate::router::claude_launcher(
+                    self.session_profiles.get(&session_id).map(String::as_str),
+                );
                 if title.is_empty() {
+                    let tab_title = self.find_session(&session_id).map(|s| s.title_label());
                     self.mode = state.return_mode;
-                    return Ok(Some(Action::ForkSession(format!(
-                        "cd '{}' && claude -r {} --fork-session",
-                        escaped_cwd, session_id
-                    ))));
+                    return Ok(Some(Action::ForkSession {
+                        cmd: format!(
+                            "cd '{}' && {} -r {} --fork-session",
+                            escaped_cwd, launcher, session_id
+                        ),
+                        title: tab_title,
+                    }));
                 }
                 let escaped_title = title.replace('\'', "'\\''");
                 self.mode = state.return_mode;
-                Ok(Some(Action::ForkSession(format!(
-                    "cd '{}' && claude -r {} --fork-session -n '{}'",
-                    escaped_cwd, session_id, escaped_title
-                ))))
+                Ok(Some(Action::ForkSession {
+                    cmd: format!(
+                        "cd '{}' && {} -r {} --fork-session -n '{}'",
+                        escaped_cwd, launcher, session_id, escaped_title
+                    ),
+                    title: Some(format!("Claude: {title}")),
+                }))
             }
         }
     }
@@ -1096,7 +1283,7 @@ pub fn run(
     let claude_home = get_claude_home();
     let session_index = search::build_session_index(&claude_home, &sessions);
     let mut app = App::new(sessions, session_index, theme, grouped_view);
-    let mut deferred_command: Option<String> = None;
+    let mut deferred_command: Option<(String, Option<String>)> = None;
 
     loop {
         app.tick_status();
@@ -1122,11 +1309,11 @@ pub fn run(
                     Action::EnterConversation(idx) => {
                         app.enter_conversation(idx);
                     }
-                    Action::CopyCommand(cmd)
-                    | Action::NewSession(cmd)
-                    | Action::ForkSession(cmd)
-                    | Action::CloneSession(cmd) => {
-                        deferred_command = Some(cmd);
+                    Action::CopyCommand { cmd, title }
+                    | Action::NewSession { cmd, title }
+                    | Action::ForkSession { cmd, title }
+                    | Action::CloneSession { cmd, title } => {
+                        deferred_command = Some((cmd, title));
                         break;
                     }
                     Action::ArchiveSession(display_idx) => match app.archive_session(display_idx) {
@@ -1168,8 +1355,15 @@ pub fn run(
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
 
-    if let Some(cmd) = deferred_command {
+    if let Some((cmd, title)) = deferred_command {
         use std::process::Command;
+        // Stamp the terminal tab with the session title so the launched agent is
+        // identifiable at a glance. The child agent (notably cursor-agent) may
+        // later set its own title; the Cursor seed prompt is shaped to carry the
+        // title into that generated name (see convert::seed_cursor_session).
+        if let Some(title) = title.as_deref().filter(|t| !t.is_empty()) {
+            let _ = execute!(std::io::stdout(), crossterm::terminal::SetTitle(title));
+        }
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
         let status = Command::new(&shell).arg("-ic").arg(&cmd).status();
         match status {

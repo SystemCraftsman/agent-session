@@ -83,6 +83,7 @@ pub fn handle_input(app: &mut App, key: KeyEvent) -> Action {
         Mode::ConfirmArchive => handle_confirm_archive(app, key),
         Mode::MoveSelectProject => handle_move_select(app, key),
         Mode::ForkSelectAgent => handle_fork_select(app, key),
+        Mode::ProfileSelect => handle_profile_select(app, key),
         Mode::TitleEdit => handle_title_edit(app, key),
     }
 }
@@ -213,6 +214,29 @@ fn handle_browse(app: &mut App, key: KeyEvent) -> Action {
                 return Action::Continue;
             }
 
+            // Ctrl-r toggles between the live list and the archived list.
+            if ctrl && c == 'r' {
+                app.toggle_archived();
+                return Action::Continue;
+            }
+            // Ctrl-u restores the selected session, but only in the archive view.
+            if ctrl && c == 'u' {
+                if app.viewing_archived {
+                    if let Some(idx) = current_selection_idx(app) {
+                        match app.restore_session(idx) {
+                            Ok(label) => app.set_status(format!("Restored: {label}")),
+                            Err(e) => app.set_status(format!("Restore failed: {e}")),
+                        }
+                    }
+                }
+                return Action::Continue;
+            }
+            // The archive view is read-only apart from restore: mutating actions
+            // (archive, new, title, move, fork, profile) are disabled there.
+            if ctrl && app.viewing_archived && matches!(c, 'a' | 'n' | 't' | 'v' | 'f' | 'p') {
+                return Action::Continue;
+            }
+
             // Action shortcuts use Ctrl so that bare typing always feeds the
             // search filter (Agent Session's "just start typing" model). Ctrl
             // shortcuts work whether or not the filter is currently active.
@@ -230,7 +254,10 @@ fn handle_browse(app: &mut App, key: KeyEvent) -> Action {
                     // the title prompt Claude uses.
                     if current_selection_agent(app) == Some(crate::session::Agent::Codex) {
                         let escaped_cwd = cwd.replace('\'', "'\\''");
-                        return Action::NewSession(format!("cd '{}' && codex", escaped_cwd));
+                        return Action::NewSession {
+                            cmd: format!("cd '{}' && codex", escaped_cwd),
+                            title: None,
+                        };
                     }
                     app.start_new_session_title(cwd);
                 }
@@ -253,6 +280,12 @@ fn handle_browse(app: &mut App, key: KeyEvent) -> Action {
             if ctrl && c == 'f' {
                 if let Some(idx) = current_selection_idx(app) {
                     app.start_fork(idx);
+                }
+                return Action::Continue;
+            }
+            if ctrl && c == 'p' {
+                if let Some(idx) = current_selection_idx(app) {
+                    app.start_profile(idx);
                 }
                 return Action::Continue;
             }
@@ -393,8 +426,16 @@ fn handle_conversation(app: &mut App, key: KeyEvent) -> Action {
         }
         KeyCode::Enter => {
             if let Some(conv) = &app.conversation {
-                let cmd = conv.session.resume_command();
-                Action::CopyCommand(cmd)
+                let launcher = crate::router::claude_launcher(
+                    app.session_profiles
+                        .get(&conv.session.id)
+                        .map(String::as_str),
+                );
+                let cmd = conv.session.resume_command_with(&launcher);
+                Action::CopyCommand {
+                    cmd,
+                    title: Some(conv.session.title_label()),
+                }
             } else {
                 Action::Continue
             }
@@ -521,13 +562,23 @@ fn handle_fork_select(app: &mut App, key: KeyEvent) -> Action {
                     crate::session::Agent::Claude | crate::session::Agent::Codex
                 );
             if native_fork {
-                Action::ForkSession(native_fork_command(&session))
+                let launcher = crate::router::claude_launcher(
+                    app.session_profiles.get(&session.id).map(String::as_str),
+                );
+                Action::ForkSession {
+                    cmd: native_fork_command(&session, &launcher),
+                    title: Some(session.title_label()),
+                }
             } else {
                 // Reconstruct (Claude/Codex targets) or context-seed (Cursor).
+                let tab_title = session.title_label();
                 match crate::convert::clone_to_other_agent(&session, target) {
                     Ok(result) => {
                         app.set_status(format!("Forking into new session {}", result.new_id));
-                        Action::CloneSession(result.resume_command)
+                        Action::CloneSession {
+                            cmd: result.resume_command,
+                            title: Some(tab_title),
+                        }
                     }
                     Err(e) => {
                         app.set_status(format!("Fork failed: {e}"));
@@ -554,12 +605,47 @@ fn handle_fork_select(app: &mut App, key: KeyEvent) -> Action {
     }
 }
 
+/// Handle keys while the per-session profile picker is open.
+fn handle_profile_select(app: &mut App, key: KeyEvent) -> Action {
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('q') => {
+            app.profile_state = None;
+            app.mode = Mode::Browsing;
+            Action::Continue
+        }
+        KeyCode::Enter => {
+            app.apply_profile();
+            Action::Continue
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            if let Some(state) = &mut app.profile_state {
+                if state.selected + 1 < state.options.len() {
+                    state.selected += 1;
+                }
+            }
+            Action::Continue
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            if let Some(state) = &mut app.profile_state {
+                state.selected = state.selected.saturating_sub(1);
+            }
+            Action::Continue
+        }
+        _ => Action::Continue,
+    }
+}
+
 /// Build the shell command for a native (same-agent) fork of `session`.
-fn native_fork_command(session: &crate::session::Session) -> String {
+/// `claude_launcher` is `claude` or a `_claude_run_<profile>` shell function so
+/// a Claude fork inherits the session's tagged profile.
+fn native_fork_command(session: &crate::session::Session, claude_launcher: &str) -> String {
     let cwd = session.cwd.replace('\'', "'\\''");
     match session.agent {
         crate::session::Agent::Claude => {
-            format!("cd '{}' && claude -r {} --fork-session", cwd, session.id)
+            format!(
+                "cd '{}' && {} -r {} --fork-session",
+                cwd, claude_launcher, session.id
+            )
         }
         crate::session::Agent::Codex => {
             format!("cd '{}' && codex fork {}", cwd, session.id)

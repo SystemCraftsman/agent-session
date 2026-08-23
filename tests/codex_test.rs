@@ -1,8 +1,9 @@
 use std::path::{Path, PathBuf};
 
 use agent_session::codex::{
-    archive_codex_session, discover_codex_sessions, load_codex_conversation, load_codex_titles,
-    move_codex_session, save_codex_title,
+    archive_codex_session, discover_archived_codex_sessions, discover_codex_sessions,
+    load_codex_conversation, load_codex_titles, move_codex_session, restore_codex_session,
+    save_codex_title,
 };
 use agent_session::session::{Agent, MessageRole};
 
@@ -155,6 +156,25 @@ fn archive_moves_rollout_out_of_sessions() {
         "rollout should live under sessions-archive with its date subpath"
     );
     assert_eq!(discover_codex_sessions(home.path()).len(), 0);
+}
+
+#[test]
+fn archived_rollout_is_discoverable_and_restorable() {
+    let home = tempfile::tempdir().unwrap();
+    let path = write_rollout(home.path(), "round-trip", "/tmp/parity-proj");
+    archive_codex_session(home.path(), path.to_str().unwrap()).unwrap();
+
+    // The archived rollout shows up in the archive listing (not the live one).
+    assert_eq!(discover_codex_sessions(home.path()).len(), 0);
+    let archived = discover_archived_codex_sessions(home.path());
+    assert_eq!(archived.len(), 1);
+    let source = archived[0].source_path.clone().expect("archived source path");
+
+    // Restoring moves it back into sessions/ with its date subpath preserved.
+    restore_codex_session(home.path(), &source).unwrap();
+    assert!(path.exists(), "restored rollout should be back in sessions/");
+    assert_eq!(discover_archived_codex_sessions(home.path()).len(), 0);
+    assert_eq!(discover_codex_sessions(home.path()).len(), 1);
 }
 
 #[test]

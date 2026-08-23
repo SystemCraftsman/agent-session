@@ -34,7 +34,20 @@ pub fn get_codex_home() -> PathBuf {
 
 /// Discover all Codex sessions under `codex_home/sessions/`.
 pub fn discover_codex_sessions(codex_home: &Path) -> Vec<Session> {
-    let sessions_dir = codex_home.join("sessions");
+    discover_codex_in(codex_home, "sessions")
+}
+
+/// Discover archived Codex sessions under `codex_home/sessions-archive/`, where
+/// [`archive_codex_session`] moves rollouts. Empty when nothing is archived.
+pub fn discover_archived_codex_sessions(codex_home: &Path) -> Vec<Session> {
+    discover_codex_in(codex_home, "sessions-archive")
+}
+
+/// Shared Codex discovery over `codex_home/<subdir>/`, used for both the live
+/// (`sessions`) and archived (`sessions-archive`) trees, which share the same
+/// date-based rollout layout.
+fn discover_codex_in(codex_home: &Path, subdir: &str) -> Vec<Session> {
+    let sessions_dir = codex_home.join(subdir);
     if !sessions_dir.is_dir() {
         return Vec::new();
     }
@@ -120,6 +133,23 @@ pub fn archive_codex_session(codex_home: &Path, source_path: &str) -> Result<(),
         fs::create_dir_all(parent).map_err(|e| format!("failed to create archive dir: {e}"))?;
     }
     fs::rename(&src, &dst).map_err(|e| format!("failed to archive session: {e}"))
+}
+
+/// Move an archived Codex rollout back into `<codex_home>/sessions/…`, reversing
+/// [`archive_codex_session`] and preserving its date-based subpath. `source_path`
+/// is the rollout's current (archived) location.
+pub fn restore_codex_session(codex_home: &Path, source_path: &str) -> Result<(), String> {
+    let src = PathBuf::from(source_path);
+    let archive_dir = codex_home.join("sessions-archive");
+    let rel = src
+        .strip_prefix(&archive_dir)
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|_| PathBuf::from(src.file_name().unwrap_or_default()));
+    let dst = codex_home.join("sessions").join(rel);
+    if let Some(parent) = dst.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("failed to create sessions dir: {e}"))?;
+    }
+    fs::rename(&src, &dst).map_err(|e| format!("failed to restore session: {e}"))
 }
 
 /// Rewrite the working directory recorded in a Codex rollout so it regroups under

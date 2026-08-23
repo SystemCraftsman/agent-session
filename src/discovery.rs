@@ -26,7 +26,21 @@ pub fn get_claude_home() -> PathBuf {
 
 /// Discover all sessions under `claude_home/projects/`.
 pub fn discover_sessions(claude_home: &Path) -> Vec<Session> {
-    let projects_dir = claude_home.join("projects");
+    discover_sessions_in(claude_home, "projects")
+}
+
+/// Discover archived sessions under `claude_home/projects-archive/`, the
+/// directory [`archive`](crate::tui) moves sessions into. Empty when nothing has
+/// been archived.
+pub fn discover_archived_sessions(claude_home: &Path) -> Vec<Session> {
+    discover_sessions_in(claude_home, "projects-archive")
+}
+
+/// Shared session discovery over `claude_home/<subdir>/`, used for both the live
+/// (`projects`) and archived (`projects-archive`) directories, which share the
+/// same `<encoded-project>/<id>.jsonl` layout.
+fn discover_sessions_in(claude_home: &Path, subdir: &str) -> Vec<Session> {
+    let projects_dir = claude_home.join(subdir);
     if !projects_dir.is_dir() {
         return Vec::new();
     }
@@ -224,10 +238,14 @@ fn parse_session_file(path: &Path) -> Option<Session> {
 /// the same role are merged into a single message with paragraphs separated by
 /// blank lines.
 pub fn load_conversation(claude_home: &Path, session: &Session) -> Vec<ConversationMessage> {
-    let file_path = claude_home
-        .join("projects")
-        .join(&session.project_path)
-        .join(format!("{}.jsonl", session.id));
+    let rel = Path::new(&session.project_path).join(format!("{}.jsonl", session.id));
+    let live_path = claude_home.join("projects").join(&rel);
+    // Fall back to the archive directory so archived sessions remain viewable.
+    let file_path = if live_path.exists() {
+        live_path
+    } else {
+        claude_home.join("projects-archive").join(&rel)
+    };
 
     let file = match fs::File::open(&file_path) {
         Ok(f) => f,

@@ -38,13 +38,27 @@ pub fn get_cursor_home() -> PathBuf {
 
 /// Discover all Cursor sessions under `cursor_home/projects/`.
 pub fn discover_cursor_sessions(cursor_home: &Path) -> Vec<Session> {
+    discover_cursor_in(cursor_home, "agent-transcripts")
+}
+
+/// Discover archived Cursor sessions from each project's
+/// `agent-transcripts-archive/` directory, where [`archive_cursor_session`]
+/// moves chats. Empty when nothing is archived.
+pub fn discover_archived_cursor_sessions(cursor_home: &Path) -> Vec<Session> {
+    discover_cursor_in(cursor_home, "agent-transcripts-archive")
+}
+
+/// Shared Cursor discovery over each project's `<subdir>/<chatId>/` directory,
+/// used for both the live (`agent-transcripts`) and archived
+/// (`agent-transcripts-archive`) trees, which share the same layout.
+fn discover_cursor_in(cursor_home: &Path, subdir: &str) -> Vec<Session> {
     let projects_dir = cursor_home.join("projects");
     if !projects_dir.is_dir() {
         return Vec::new();
     }
 
     // Collect every `<chatId>.jsonl` transcript under any project's
-    // `agent-transcripts/<chatId>/` directory.
+    // `<subdir>/<chatId>/` directory.
     let mut transcripts: Vec<PathBuf> = Vec::new();
     if let Ok(projects) = fs::read_dir(&projects_dir) {
         for proj in projects.flatten() {
@@ -52,7 +66,7 @@ pub fn discover_cursor_sessions(cursor_home: &Path) -> Vec<Session> {
             if !ppath.is_dir() {
                 continue;
             }
-            let transcripts_dir = ppath.join("agent-transcripts");
+            let transcripts_dir = ppath.join(subdir);
             let Ok(chats) = fs::read_dir(&transcripts_dir) else {
                 continue;
             };
@@ -143,15 +157,66 @@ pub fn archive_cursor_session(source_path: &str) -> Result<(), String> {
     let proj_dir = transcripts_dir
         .parent()
         .ok_or("cursor transcript missing project directory")?;
-    let chat_name = chat_dir
-        .file_name()
-        .ok_or("cursor transcript missing chat id")?;
 
     let archive_dir = proj_dir.join("agent-transcripts-archive");
-    fs::create_dir_all(&archive_dir)
-        .map_err(|e| format!("failed to create cursor archive dir: {e}"))?;
-    let dst = archive_dir.join(chat_name);
-    fs::rename(chat_dir, &dst).map_err(|e| format!("failed to archive cursor session: {e}"))
+    move_chat_dir(chat_dir, &archive_dir)
+}
+
+/// Move a Cursor chat directory into `dest_parent`, disambiguating with a numeric
+/// suffix when a chat of the same id already lives there (e.g. a stale archived
+/// stub), and keeping the inner `<name>.jsonl` transcript in sync with the final
+/// directory name so discovery, which keys off the directory name, still finds
+/// it. Non-destructive: an existing chat directory is never overwritten.
+fn move_chat_dir(chat_dir: &Path, dest_parent: &Path) -> Result<(), String> {
+    fs::create_dir_all(dest_parent).map_err(|e| format!("failed to create cursor dir: {e}"))?;
+    let chat_name = chat_dir
+        .file_name()
+        .ok_or("cursor transcript missing chat id")?
+        .to_string_lossy()
+        .to_string();
+
+    let mut final_name = chat_name.clone();
+    let mut dst = dest_parent.join(&final_name);
+    let mut n = 2;
+    while dst.exists() {
+        final_name = format!("{chat_name}-{n}");
+        dst = dest_parent.join(&final_name);
+        n += 1;
+    }
+
+    fs::rename(chat_dir, &dst).map_err(|e| format!("failed to move cursor session: {e}"))?;
+
+    // If we had to suffix the directory, rename the inner transcript to match so
+    // the directory name and `<name>.jsonl` stay consistent for discovery.
+    if final_name != chat_name {
+        let old_jsonl = dst.join(format!("{chat_name}.jsonl"));
+        let new_jsonl = dst.join(format!("{final_name}.jsonl"));
+        if old_jsonl.exists() {
+            fs::rename(&old_jsonl, &new_jsonl)
+                .map_err(|e| format!("failed to rename cursor transcript: {e}"))?;
+        }
+    }
+    Ok(())
+}
+
+/// Move an archived Cursor chat directory back into the live
+/// `agent-transcripts/` directory, reversing [`archive_cursor_session`].
+/// `source_path` is the archived transcript's `<chatId>.jsonl` path.
+pub fn restore_cursor_session(source_path: &str) -> Result<(), String> {
+    let jsonl = PathBuf::from(source_path);
+    // .../agent-transcripts-archive/<chatId>/<chatId>.jsonl -> chat dir, archive dir
+    let chat_dir = jsonl
+        .parent()
+        .ok_or("cursor transcript missing chat directory")?;
+    let archive_dir = chat_dir
+        .parent()
+        .ok_or("cursor transcript missing agent-transcripts-archive directory")?;
+    let proj_dir = archive_dir
+        .parent()
+        .ok_or("cursor transcript missing project directory")?;
+
+    let live_dir = proj_dir.join("agent-transcripts");
+    move_chat_dir(chat_dir, &live_dir)
 }
 
 /// Move a Cursor session to a different project directory. Because Cursor

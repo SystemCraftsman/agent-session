@@ -46,13 +46,14 @@ pub fn clone_to_other_agent(session: &Session, target: Agent) -> Result<CloneRes
     match target {
         Agent::Claude => write_claude_session(session, &messages),
         Agent::Codex => write_codex_session(session, &messages),
-        // A same-agent reseed reads as a "fork"; a cross-agent one as a
-        // "reconstruct", matching the Claude/Codex title strategy.
+        // Cursor targets are context-seeded, not reconstructed into a native
+        // file: a same-agent copy reads as a "fork", a cross-agent one as a
+        // "seed".
         Agent::Cursor => {
             let suffix = if session.agent == target {
                 "fork"
             } else {
-                "reconstruct"
+                "seed"
             };
             seed_cursor_session(session, &messages, suffix)
         }
@@ -366,8 +367,13 @@ fn seed_cursor_session(
     }
 
     let import_str = import_path.to_string_lossy();
+    // Lead the prompt with the session title so Cursor's own auto-generated chat
+    // title (which it derives from the opening prompt and writes to the terminal
+    // tab) reflects the source session rather than a generic summary.
+    let tab_title = session.title_label();
     let prompt = format!(
-        "We are continuing a prior {source_agent} conversation. \
+        "{tab_title}\n\n\
+         We are continuing a prior {source_agent} conversation. \
          The full transcript is saved at {import_str}. \
          Please read that file, then continue helping me from where we left off."
     );
