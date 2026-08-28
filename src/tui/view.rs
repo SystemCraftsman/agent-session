@@ -63,6 +63,9 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     if app.mode == Mode::ForkSelectAgent {
         render_fork_picker(frame, app, area);
     }
+    if app.mode == Mode::NewSelectAgent {
+        render_new_agent_picker(frame, app, area);
+    }
     if app.mode == Mode::ProfileSelect {
         render_profile_picker(frame, app, area);
     }
@@ -467,6 +470,59 @@ fn render_fork_picker(frame: &mut Frame, app: &App, area: Rect) {
         .borders(Borders::ALL)
         .border_style(Style::default().fg(app.theme.cursor_color))
         .title(" Fork to agent ")
+        .title_style(Style::default().fg(app.theme.cursor_color).bold());
+
+    let paragraph = Paragraph::new(Text::from(lines)).block(block);
+    frame.render_widget(paragraph, popup_area);
+}
+
+/// Render the agent picker for a new session (Claude / Codex / Cursor).
+fn render_new_agent_picker(frame: &mut Frame, app: &App, area: Rect) {
+    let state = match &app.new_session_state {
+        Some(s) => s,
+        None => return,
+    };
+
+    let max_w = 44u16.min(area.width.saturating_sub(4)).max(20);
+    let max_h = (state.options.len() as u16 + 2)
+        .min(area.height.saturating_sub(4))
+        .max(4);
+    let x = (area.width.saturating_sub(max_w)) / 2;
+    let y = (area.height.saturating_sub(max_h)) / 2;
+    let popup_area = Rect::new(x, y, max_w, max_h);
+
+    frame.render_widget(ratatui::widgets::Clear, popup_area);
+
+    let inner_w = max_w.saturating_sub(2) as usize;
+    let mut lines: Vec<Line> = Vec::new();
+    for (i, agent) in state.options.iter().enumerate() {
+        let is_sel = i == state.selected;
+        let (prefix, style) = if is_sel {
+            (
+                "\u{27A4} ",
+                Style::default().fg(app.theme.cursor_color).bold(),
+            )
+        } else {
+            ("  ", Style::default().fg(app.theme.text))
+        };
+        let label = agent.label().to_string();
+        let pad = inner_w.saturating_sub(prefix.chars().count() + label.chars().count());
+        let line = Line::from(vec![
+            Span::styled(prefix, style),
+            Span::styled(label, style),
+            Span::raw(" ".repeat(pad)),
+        ]);
+        if is_sel {
+            lines.push(line.patch_style(Style::default().bg(app.theme.selected_bg)));
+        } else {
+            lines.push(line);
+        }
+    }
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(app.theme.cursor_color))
+        .title(" New session with ")
         .title_style(Style::default().fg(app.theme.cursor_color).bold());
 
     let paragraph = Paragraph::new(Text::from(lines)).block(block);
@@ -1192,6 +1248,21 @@ fn render_status_bar(frame: &mut Frame, app: &App, area: Rect) {
             Line::from(vec![
                 Span::styled(
                     " Fork to which agent: ",
+                    Style::default().fg(app.theme.cursor_color).bold(),
+                ),
+                Span::styled("↑↓", key_style),
+                Span::styled(" navigate  ", dim),
+                Span::styled("Enter", key_style),
+                Span::styled(" confirm  ", dim),
+                Span::styled("Esc", key_style),
+                Span::styled(" cancel", dim),
+            ])
+        }
+        Mode::NewSelectAgent => {
+            let key_style = Style::default().fg(Color::White).bold();
+            Line::from(vec![
+                Span::styled(
+                    " New session with which AI: ",
                     Style::default().fg(app.theme.cursor_color).bold(),
                 ),
                 Span::styled("↑↓", key_style),

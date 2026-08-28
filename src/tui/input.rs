@@ -43,31 +43,6 @@ fn current_selection_cwd(app: &App) -> Option<String> {
     }
 }
 
-/// Resolve which agent owns the current selection, so per-agent actions (e.g.
-/// launching a new session) use the right CLI. A project header reports its
-/// first (newest) session's agent.
-fn current_selection_agent(app: &App) -> Option<crate::session::Agent> {
-    if app.grouped_view {
-        match app.selected_tree_row().cloned() {
-            Some(TreeRow::Project(gi)) => {
-                let di = *app.project_groups.get(gi)?.session_indices.first()?;
-                Some(app.display_session(app.display_entries.get(di)?).agent)
-            }
-            Some(TreeRow::Session { display_idx, .. }) => Some(
-                app.display_session(app.display_entries.get(display_idx)?)
-                    .agent,
-            ),
-            None => None,
-        }
-    } else if app.selected < app.display_entries.len() {
-        Some(
-            app.display_session(&app.display_entries[app.selected])
-                .agent,
-        )
-    } else {
-        None
-    }
-}
 
 /// Handle a key event and return the resulting action.
 pub fn handle_input(app: &mut App, key: KeyEvent) -> Action {
@@ -83,6 +58,7 @@ pub fn handle_input(app: &mut App, key: KeyEvent) -> Action {
         Mode::ConfirmArchive => handle_confirm_archive(app, key),
         Mode::MoveSelectProject => handle_move_select(app, key),
         Mode::ForkSelectAgent => handle_fork_select(app, key),
+        Mode::NewSelectAgent => handle_new_agent_select(app, key),
         Mode::ProfileSelect => handle_profile_select(app, key),
         Mode::TitleEdit => handle_title_edit(app, key),
     }
@@ -249,17 +225,10 @@ fn handle_browse(app: &mut App, key: KeyEvent) -> Action {
                 return Action::Continue;
             }
             if ctrl && c == 'n' {
+                // Start a new session in the selected row's working directory,
+                // asking which AI to launch.
                 if let Some(cwd) = current_selection_cwd(app).filter(|c| !c.is_empty()) {
-                    // Codex has no session-name flag, so launch directly without
-                    // the title prompt Claude uses.
-                    if current_selection_agent(app) == Some(crate::session::Agent::Codex) {
-                        let escaped_cwd = cwd.replace('\'', "'\\''");
-                        return Action::NewSession {
-                            cmd: format!("cd '{}' && codex", escaped_cwd),
-                            title: None,
-                        };
-                    }
-                    app.start_new_session_title(cwd);
+                    app.start_new_session(cwd);
                 }
                 return Action::Continue;
             }
@@ -597,6 +566,65 @@ fn handle_fork_select(app: &mut App, key: KeyEvent) -> Action {
         }
         KeyCode::Up | KeyCode::Char('k') => {
             if let Some(state) = &mut app.fork_state {
+                state.selected = state.selected.saturating_sub(1);
+            }
+            Action::Continue
+        }
+        _ => Action::Continue,
+    }
+}
+
+/// Handle keys while the new-session agent picker is open.
+fn handle_new_agent_select(app: &mut App, key: KeyEvent) -> Action {
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('q') => {
+            app.new_session_state = None;
+            app.mode = Mode::Browsing;
+            Action::Continue
+        }
+        KeyCode::Enter => {
+            let Some(state) = app.new_session_state.take() else {
+                app.mode = Mode::Browsing;
+                return Action::Continue;
+            };
+            let agent = state.options[state.selected];
+            let cwd = state.cwd;
+            let escaped_cwd = cwd.replace('\'', "'\\''");
+            match agent {
+                // Claude supports a session-name flag, so prompt for a title
+                // first; the title-edit flow builds and launches the command.
+                crate::session::Agent::Claude => {
+                    app.start_new_session_title(cwd);
+                    Action::Continue
+                }
+                // Codex and Cursor have no new-session title flag, so launch
+                // directly. A generic label keeps the terminal tab readable.
+                crate::session::Agent::Codex => {
+                    app.mode = Mode::Browsing;
+                    Action::NewSession {
+                        cmd: format!("cd '{escaped_cwd}' && codex"),
+                        title: Some("Codex session".to_string()),
+                    }
+                }
+                crate::session::Agent::Cursor => {
+                    app.mode = Mode::Browsing;
+                    Action::NewSession {
+                        cmd: format!("cd '{escaped_cwd}' && cursor-agent"),
+                        title: Some("Cursor session".to_string()),
+                    }
+                }
+            }
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            if let Some(state) = &mut app.new_session_state {
+                if state.selected + 1 < state.options.len() {
+                    state.selected += 1;
+                }
+            }
+            Action::Continue
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            if let Some(state) = &mut app.new_session_state {
                 state.selected = state.selected.saturating_sub(1);
             }
             Action::Continue

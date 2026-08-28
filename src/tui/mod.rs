@@ -35,6 +35,7 @@ pub enum Mode {
     ConfirmArchive,
     MoveSelectProject,
     ForkSelectAgent,
+    NewSelectAgent,
     ProfileSelect,
     TitleEdit,
 }
@@ -226,6 +227,14 @@ pub struct ForkState {
     pub selected: usize,
 }
 
+/// State for the agent picker shown when starting a new session, so the user
+/// chooses which AI (Claude / Codex / Cursor) to launch.
+pub struct NewSessionState {
+    pub cwd: String,
+    pub options: Vec<crate::session::Agent>,
+    pub selected: usize,
+}
+
 /// State for the per-session profile picker (Claude sessions only). Each option
 /// is a profile to set, or `None` for the "clear tag" choice (fall back to the
 /// global default).
@@ -313,6 +322,8 @@ pub struct App {
     pub move_state: Option<MoveState>,
     /// State for the fork target-agent picker.
     pub fork_state: Option<ForkState>,
+    /// State for the new-session agent picker.
+    pub new_session_state: Option<NewSessionState>,
     /// Title being edited.
     pub title_edit: Option<TitleEditState>,
     /// Cached default claude profile label from `~/.claude-default-profile`.
@@ -371,6 +382,7 @@ impl App {
             archive_confirm: None,
             move_state: None,
             fork_state: None,
+            new_session_state: None,
             title_edit: None,
             profile_label: crate::router::profile_name(),
             profile_state: None,
@@ -983,6 +995,18 @@ impl App {
             return_mode: Mode::Browsing,
         });
         self.mode = Mode::TitleEdit;
+    }
+
+    /// Start the agent picker for a new session in `cwd`, letting the user choose
+    /// which AI (Claude / Codex / Cursor) to launch.
+    pub fn start_new_session(&mut self, cwd: String) {
+        use crate::session::Agent;
+        self.new_session_state = Some(NewSessionState {
+            cwd,
+            options: vec![Agent::Claude, Agent::Codex, Agent::Cursor],
+            selected: 0,
+        });
+        self.mode = Mode::NewSelectAgent;
     }
 
     /// Start title input for forking a session.
