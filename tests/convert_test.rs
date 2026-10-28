@@ -55,7 +55,11 @@ fn write_codex_source(codex_home: &Path, cwd: &str) -> Session {
         id = id,
         cwd = cwd,
     );
-    std::fs::write(dir.join(format!("rollout-2026-04-01T10-00-00-{id}.jsonl")), body).unwrap();
+    std::fs::write(
+        dir.join(format!("rollout-2026-04-01T10-00-00-{id}.jsonl")),
+        body,
+    )
+    .unwrap();
 
     discover_codex_sessions(codex_home)
         .into_iter()
@@ -75,9 +79,10 @@ fn clones_claude_session_into_native_codex_rollout() {
     let source = write_claude_source(claude_home.path(), cwd);
 
     let result = clone_to_other_agent(&source, Agent::Codex).expect("clone succeeds");
-    assert!(result
-        .resume_command
-        .contains(&format!("codex resume {}", result.new_id)));
+    assert!(result.resume_command.contains(&format!(
+        "codex -c 'tui.terminal_title=[]' resume {}",
+        result.new_id
+    )));
     assert!(result.resume_command.contains(cwd));
 
     // The synthesized file must be discoverable as a real Codex session...
@@ -103,6 +108,70 @@ fn clones_claude_session_into_native_codex_rollout() {
     assert_eq!(messages[1].text, "Done, all tests pass.");
 
     std::env::remove_var("CLAUDE_HOME");
+    std::env::remove_var("CODEX_HOME");
+}
+
+#[test]
+#[serial]
+fn copies_codex_session_with_new_identity_and_fork_title() {
+    let codex_home = tempfile::tempdir().unwrap();
+    std::env::set_var("CODEX_HOME", codex_home.path());
+    let mut source = write_codex_source(codex_home.path(), "/tmp/codex-fork-project");
+    source.custom_title = Some("Agent Session".to_string());
+    let source_path = source.source_path.as_ref().unwrap();
+    let lines: Vec<String> = std::fs::read_to_string(source_path)
+        .unwrap()
+        .lines()
+        .map(str::to_string)
+        .collect();
+    let mut meta: serde_json::Value = serde_json::from_str(&lines[0]).unwrap();
+    let payload = meta["payload"].as_object_mut().unwrap();
+    payload.insert("session_id".into(), serde_json::json!(source.id));
+    payload.insert("forked_from_id".into(), serde_json::json!("prior-fork"));
+    payload.insert(
+        "creator_account_id".into(),
+        serde_json::json!("old-account"),
+    );
+    payload.insert("creator_user_id".into(), serde_json::json!("old-user"));
+    let mut turn: serde_json::Value = serde_json::from_str(&lines[1]).unwrap();
+    turn["payload"]["turn_id"] = serde_json::json!("old-turn");
+    turn["payload"]["summary"] = serde_json::json!("unrelated summary");
+    std::fs::write(
+        source_path,
+        format!("{}\n{}\n{}\n", meta, turn, lines[2..].join("\n")),
+    )
+    .unwrap();
+
+    let result = clone_to_other_agent(&source, Agent::Codex).unwrap();
+    assert_ne!(result.new_id, source.id);
+    assert_eq!(result.title, "Agent Session (fork)");
+    assert!(result
+        .resume_command
+        .contains(&format!("resume {}", result.new_id)));
+    assert!(!result.resume_command.contains("codex fork"));
+
+    let sessions = discover_codex_sessions(codex_home.path());
+    assert_eq!(sessions.len(), 2);
+    let cloned = sessions.iter().find(|s| s.id == result.new_id).unwrap();
+    assert_eq!(cloned.custom_title.as_deref(), Some("Agent Session (fork)"));
+    assert_eq!(load_codex_conversation(cloned).len(), 2);
+    let cloned_file = std::fs::read_to_string(cloned.source_path.as_ref().unwrap()).unwrap();
+    let mut cloned_lines = cloned_file.lines();
+    let cloned_meta: serde_json::Value =
+        serde_json::from_str(cloned_lines.next().unwrap()).unwrap();
+    let cloned_payload = &cloned_meta["payload"];
+    assert_eq!(cloned_payload["id"], result.new_id);
+    assert_eq!(cloned_payload["session_id"], result.new_id);
+    for key in ["forked_from_id", "creator_account_id", "creator_user_id"] {
+        assert!(
+            cloned_payload.get(key).is_none(),
+            "unexpected inherited {key}"
+        );
+    }
+    let cloned_turn: serde_json::Value =
+        serde_json::from_str(cloned_lines.next().unwrap()).unwrap();
+    assert!(cloned_turn["payload"].get("turn_id").is_none());
+    assert!(cloned_turn["payload"].get("summary").is_none());
     std::env::remove_var("CODEX_HOME");
 }
 

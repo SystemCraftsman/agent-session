@@ -231,3 +231,87 @@ fn tree_row_equality() {
         }
     );
 }
+
+#[test]
+fn reconstruct_clones_cluster_with_recent_on_top() {
+    use agent_session::session::{Agent, Session};
+    use chrono::{TimeZone, Utc};
+
+    let cwd = "/Users/test/cc-session";
+    // Same base title across providers/clones: a plain title and its stacked
+    // "(reconstruct)" descendants must cluster, newest first. An unrelated title
+    // in the same project must stay in its own cluster.
+    let sessions = vec![
+        Session {
+            id: "base".into(),
+            project_path: cwd.into(),
+            project_name: "cc-session".into(),
+            git_branch: None,
+            timestamp: Utc.with_ymd_and_hms(2026, 9, 1, 10, 0, 0).unwrap(),
+            first_message: "cc-session development".into(),
+            cwd: cwd.into(),
+            project_exists: false,
+            custom_title: None,
+            agent: Agent::Claude,
+            source_path: None,
+        },
+        Session {
+            id: "recon2".into(),
+            project_path: cwd.into(),
+            project_name: "cc-session".into(),
+            git_branch: None,
+            // Most recently used clone: should float to the top of the cluster.
+            timestamp: Utc.with_ymd_and_hms(2026, 9, 5, 10, 0, 0).unwrap(),
+            first_message: "unused".into(),
+            cwd: cwd.into(),
+            project_exists: false,
+            custom_title: Some("cc-session development (reconstruct) (reconstruct)".into()),
+            agent: Agent::Codex,
+            source_path: Some("/tmp/rollout.jsonl".into()),
+        },
+        Session {
+            id: "recon1".into(),
+            project_path: cwd.into(),
+            project_name: "cc-session".into(),
+            git_branch: None,
+            timestamp: Utc.with_ymd_and_hms(2026, 9, 3, 10, 0, 0).unwrap(),
+            first_message: "unused".into(),
+            cwd: cwd.into(),
+            project_exists: false,
+            custom_title: Some("cc-session development (reconstruct)".into()),
+            agent: Agent::Cursor,
+            source_path: None,
+        },
+        Session {
+            id: "other".into(),
+            project_path: cwd.into(),
+            project_name: "cc-session".into(),
+            git_branch: None,
+            timestamp: Utc.with_ymd_and_hms(2026, 9, 2, 10, 0, 0).unwrap(),
+            first_message: "unrelated task".into(),
+            cwd: cwd.into(),
+            project_exists: false,
+            custom_title: None,
+            agent: Agent::Claude,
+            source_path: None,
+        },
+    ];
+
+    let entries = make_display_entries(&sessions);
+    let groups = group_by_project(&sessions, &entries);
+    assert_eq!(groups.len(), 1, "all sessions share one project");
+
+    // Order the session ids as they appear in the group.
+    let order: Vec<&str> = groups[0]
+        .session_indices
+        .iter()
+        .map(|&di| match entries[di].source {
+            DisplaySource::Sessions(idx) => sessions[idx].id.as_str(),
+            DisplaySource::Content(_) => unreachable!(),
+        })
+        .collect();
+
+    // The reconstruct cluster (max ts 2026-09-05) leads, newest clone on top,
+    // then its older members; the unrelated cluster follows.
+    assert_eq!(order, vec!["recon2", "recon1", "base", "other"]);
+}

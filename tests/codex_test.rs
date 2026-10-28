@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use agent_session::codex::{
     archive_codex_session, discover_archived_codex_sessions, discover_codex_sessions,
     load_codex_conversation, load_codex_titles, move_codex_session, restore_codex_session,
-    save_codex_title,
+    save_codex_title, save_codex_title_for_path,
 };
 use agent_session::session::{Agent, MessageRole};
 
@@ -28,6 +28,110 @@ fn write_rollout(home: &Path, id: &str, cwd: &str) -> PathBuf {
     );
     std::fs::write(&path, body).unwrap();
     path
+}
+
+fn write_fork_rollout(home: &Path, id: &str, cwd: &str, parent_id: &str) -> PathBuf {
+    let path = write_rollout(home, id, cwd);
+    let body = std::fs::read_to_string(&path).unwrap();
+    let metadata_start = format!("\"id\":\"{id}\",\"cwd\":");
+    let with_parent = format!("\"id\":\"{id}\",\"forked_from_id\":\"{parent_id}\",\"cwd\":");
+    std::fs::write(&path, body.replacen(&metadata_start, &with_parent, 1)).unwrap();
+    path
+}
+
+#[test]
+fn codex_forks_have_independent_titles() {
+    let home = tempfile::tempdir().unwrap();
+    write_rollout(home.path(), "original", "/tmp/parity-proj");
+    write_fork_rollout(home.path(), "fork", "/tmp/parity-proj", "original");
+    save_codex_title(home.path(), "original", "Agent Session").unwrap();
+
+    let sessions = discover_codex_sessions(home.path());
+    let original = sessions.iter().find(|s| s.id == "original").unwrap();
+    let fork = sessions.iter().find(|s| s.id == "fork").unwrap();
+    assert_eq!(original.custom_title.as_deref(), Some("Agent Session"));
+    assert_eq!(fork.custom_title.as_deref(), Some("Hello there (fork)"));
+
+    save_codex_title(home.path(), "fork", "Agent Session (fork)").unwrap();
+    let sessions = discover_codex_sessions(home.path());
+    assert_eq!(
+        sessions
+            .iter()
+            .find(|s| s.id == "original")
+            .unwrap()
+            .custom_title
+            .as_deref(),
+        Some("Agent Session")
+    );
+    assert_eq!(
+        sessions
+            .iter()
+            .find(|s| s.id == "fork")
+            .unwrap()
+            .custom_title
+            .as_deref(),
+        Some("Agent Session (fork)")
+    );
+}
+
+#[test]
+fn rollout_titles_are_independent_even_when_ids_match() {
+    let home = tempfile::tempdir().unwrap();
+    let first_path = write_rollout(home.path(), "shared", "/tmp/first-project");
+    let second_dir = home.path().join("sessions/2026/03/25");
+    std::fs::create_dir_all(&second_dir).unwrap();
+    let second_path = second_dir.join(first_path.file_name().unwrap());
+    let first_body = std::fs::read_to_string(&first_path).unwrap();
+    std::fs::write(
+        &second_path,
+        first_body.replace("/tmp/first-project", "/tmp/second-project"),
+    )
+    .unwrap();
+    save_codex_title(home.path(), "shared", "Legacy title").unwrap();
+    save_codex_title_for_path(home.path(), &first_path, "First title").unwrap();
+    save_codex_title_for_path(home.path(), &second_path, "Second title").unwrap();
+
+    let sessions = discover_codex_sessions(home.path());
+    assert_eq!(sessions.len(), 2);
+    assert_eq!(
+        sessions
+            .iter()
+            .find(|session| session.cwd == "/tmp/first-project")
+            .unwrap()
+            .custom_title
+            .as_deref(),
+        Some("First title")
+    );
+    assert_eq!(
+        sessions
+            .iter()
+            .find(|session| session.cwd == "/tmp/second-project")
+            .unwrap()
+            .custom_title
+            .as_deref(),
+        Some("Second title")
+    );
+
+    save_codex_title_for_path(home.path(), &first_path, "").unwrap();
+    let sessions = discover_codex_sessions(home.path());
+    assert_eq!(
+        sessions
+            .iter()
+            .find(|session| session.cwd == "/tmp/first-project")
+            .unwrap()
+            .custom_title,
+        None,
+        "clearing one title must not revive the shared legacy title"
+    );
+    assert_eq!(
+        sessions
+            .iter()
+            .find(|session| session.cwd == "/tmp/second-project")
+            .unwrap()
+            .custom_title
+            .as_deref(),
+        Some("Second title")
+    );
 }
 
 #[test]
@@ -72,11 +176,11 @@ fn resume_command_uses_codex_shell_wrapper() {
         .iter()
         .find(|s| s.id == "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
         .expect("session aaaa present");
-    // Agent Session emits a bare `codex`; the user's `codex()` shell function owns
-    // any wrapping (mirroring the `claude` wrapper).
+    // The user's `codex()` shell function still owns profile and proxy routing;
+    // Agent Session only prevents Codex from replacing its terminal title.
     assert_eq!(
         s.resume_command(),
-        "cd '/tmp/codex-fixture-project' && codex resume aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+        "cd '/tmp/codex-fixture-project' && codex -c 'tui.terminal_title=[]' resume aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
     );
 }
 
@@ -162,19 +266,29 @@ fn archive_moves_rollout_out_of_sessions() {
 fn archived_rollout_is_discoverable_and_restorable() {
     let home = tempfile::tempdir().unwrap();
     let path = write_rollout(home.path(), "round-trip", "/tmp/parity-proj");
+    save_codex_title_for_path(home.path(), &path, "Keep title").unwrap();
     archive_codex_session(home.path(), path.to_str().unwrap()).unwrap();
 
     // The archived rollout shows up in the archive listing (not the live one).
     assert_eq!(discover_codex_sessions(home.path()).len(), 0);
     let archived = discover_archived_codex_sessions(home.path());
     assert_eq!(archived.len(), 1);
-    let source = archived[0].source_path.clone().expect("archived source path");
+    assert_eq!(archived[0].custom_title.as_deref(), Some("Keep title"));
+    let source = archived[0]
+        .source_path
+        .clone()
+        .expect("archived source path");
 
     // Restoring moves it back into sessions/ with its date subpath preserved.
     restore_codex_session(home.path(), &source).unwrap();
-    assert!(path.exists(), "restored rollout should be back in sessions/");
+    assert!(
+        path.exists(),
+        "restored rollout should be back in sessions/"
+    );
     assert_eq!(discover_archived_codex_sessions(home.path()).len(), 0);
-    assert_eq!(discover_codex_sessions(home.path()).len(), 1);
+    let restored = discover_codex_sessions(home.path());
+    assert_eq!(restored.len(), 1);
+    assert_eq!(restored[0].custom_title.as_deref(), Some("Keep title"));
 }
 
 #[test]

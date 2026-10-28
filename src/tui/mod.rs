@@ -1,11 +1,12 @@
 pub mod input;
+mod launch;
 pub mod syntax;
 pub mod table;
 pub mod view;
 
 use std::collections::{HashMap, HashSet};
 use std::io::stdout;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
@@ -25,6 +26,7 @@ use crate::session::{ConversationMessage, Session};
 use crate::theme::Theme;
 
 use input::handle_input;
+use launch::{wait_for_agent, NewSessionLaunch};
 
 /// TUI interaction mode.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -36,6 +38,7 @@ pub enum Mode {
     MoveSelectProject,
     ForkSelectAgent,
     NewSelectAgent,
+    NewSelectProfile,
     ProfileSelect,
     TitleEdit,
 }
@@ -78,10 +81,26 @@ pub enum Action {
     Continue,
     Quit,
     EnterConversation(usize),
-    CopyCommand { cmd: String, title: Option<String> },
-    NewSession { cmd: String, title: Option<String> },
-    ForkSession { cmd: String, title: Option<String> },
-    CloneSession { cmd: String, title: Option<String> },
+    CopyCommand {
+        cmd: String,
+        title: Option<String>,
+    },
+    NewSession {
+        cmd: String,
+        title: Option<String>,
+        agent: crate::session::Agent,
+        profile: Option<String>,
+        cwd: String,
+    },
+    ForkSession {
+        cmd: String,
+        title: Option<String>,
+    },
+    CloneSession {
+        cmd: String,
+        title: Option<String>,
+        warning: Option<String>,
+    },
     BackToList,
     ArchiveSession(usize),
     MoveSession {
@@ -120,7 +139,8 @@ fn encode_claude_dir(cwd: &str) -> String {
 
 /// Build project groups from a flat list of sessions.
 /// Groups are sorted by the latest session timestamp (newest group first).
-/// Sessions within each group are ordered by their position in `display_entries`.
+/// Sessions within each group are ordered by display name (title), so equally
+/// titled sessions - e.g. the same session across providers - appear adjacent.
 pub fn group_by_project(
     sessions: &[Session],
     display_entries: &[DisplayEntry],
@@ -153,16 +173,80 @@ pub fn group_by_project_with_content(
         group_map.entry(group_key).or_default().push(di);
     }
 
+    // Resolve the session behind a display index (a normal session or a
+    // content-only search hit).
+    let session_at = |di: usize| -> Option<&Session> {
+        match &display_entries.get(di)?.source {
+            DisplaySource::Sessions(idx) => sessions.get(*idx),
+            DisplaySource::Content(idx) => content_results.get(*idx),
+        }
+    };
+    // Sort key for a session row: the displayed name (custom title, else first
+    // message), normalized so a title and its clones cluster together. Clone
+    // suffixes added on fork/transfer - "(reconstruct)", "(fork)", "(seed)",
+    // possibly stacked - don't change identity, so we strip any trailing stack of
+    // them, then lower-case for case-insensitive grouping.
+    fn sort_title(s: &Session) -> String {
+        let raw = s
+            .custom_title
+            .clone()
+            .unwrap_or_else(|| s.first_message.clone());
+        let mut base = raw.trim();
+        loop {
+            let trimmed = base.trim_end();
+            match ["(reconstruct)", "(fork)", "(seed)"]
+                .iter()
+                .find_map(|suf| trimmed.strip_suffix(suf))
+            {
+                Some(rest) => base = rest.trim_end(),
+                None => break,
+            }
+        }
+        base.to_lowercase()
+    }
+
     let mut groups: Vec<ProjectGroup> = group_map
         .into_iter()
-        .map(|(path, indices)| {
-            let first_session =
-                indices
-                    .first()
-                    .and_then(|&di| match &display_entries.get(di)?.source {
-                        DisplaySource::Sessions(idx) => sessions.get(*idx),
-                        DisplaySource::Content(idx) => content_results.get(*idx),
-                    });
+        .map(|(path, mut indices)| {
+            // Cluster identically titled sessions together - e.g. the same
+            // session forked or transferred across providers. Clusters are
+            // ordered by recency (the most recently used cluster first) and,
+            // within a cluster, newest first, so the most recently used variant
+            // sits at the very top of its cluster.
+            let mut cluster_recency: HashMap<String, DateTime<Utc>> = HashMap::new();
+            for &di in &indices {
+                if let Some(s) = session_at(di) {
+                    let ts = display_entries[di].timestamp;
+                    cluster_recency
+                        .entry(sort_title(s))
+                        .and_modify(|m| {
+                            if ts > *m {
+                                *m = ts;
+                            }
+                        })
+                        .or_insert(ts);
+                }
+            }
+            indices.sort_by(|&a, &b| {
+                let ta = session_at(a).map(sort_title).unwrap_or_default();
+                let tb = session_at(b).map(sort_title).unwrap_or_default();
+                let ra = cluster_recency
+                    .get(&ta)
+                    .copied()
+                    .unwrap_or(DateTime::<Utc>::MIN_UTC);
+                let rb = cluster_recency
+                    .get(&tb)
+                    .copied()
+                    .unwrap_or(DateTime::<Utc>::MIN_UTC);
+                // Most recent cluster first; keep same-title together (needed when
+                // two clusters share the same recency); newest within a cluster first.
+                rb.cmp(&ra).then_with(|| ta.cmp(&tb)).then_with(|| {
+                    display_entries[b]
+                        .timestamp
+                        .cmp(&display_entries[a].timestamp)
+                })
+            });
+            let first_session = indices.first().and_then(|&di| session_at(di));
             let name = first_session
                 .map(|s| s.project_name.clone())
                 .unwrap_or_else(|| "unknown".to_string());
@@ -177,19 +261,18 @@ pub fn group_by_project_with_content(
         })
         .collect();
 
-    // Sort groups by latest activity (newest first)
+    // Sort groups by latest activity (newest first). Because sessions within a
+    // group are now name-ordered rather than time-ordered, use the maximum
+    // timestamp across the group instead of its first entry.
     groups.sort_by(|a, b| {
-        let ts_a = a
-            .session_indices
-            .first()
-            .map(|&i| display_entries[i].timestamp)
-            .unwrap_or_else(|| DateTime::<Utc>::MIN_UTC);
-        let ts_b = b
-            .session_indices
-            .first()
-            .map(|&i| display_entries[i].timestamp)
-            .unwrap_or_else(|| DateTime::<Utc>::MIN_UTC);
-        ts_b.cmp(&ts_a)
+        let latest = |g: &ProjectGroup| {
+            g.session_indices
+                .iter()
+                .map(|&i| display_entries[i].timestamp)
+                .max()
+                .unwrap_or(DateTime::<Utc>::MIN_UTC)
+        };
+        latest(b).cmp(&latest(a))
     });
 
     groups
@@ -219,8 +302,7 @@ pub struct MoveState {
     pub selected: usize,
 }
 
-/// State for the target-agent picker when forking a session. The two options are
-/// the source agent (a native fork) and the other agent (a reconstructed clone).
+/// State for the target-agent picker when forking a session.
 pub struct ForkState {
     pub session: Session,
     pub options: Vec<crate::session::Agent>,
@@ -235,19 +317,29 @@ pub struct NewSessionState {
     pub selected: usize,
 }
 
-/// State for the per-session profile picker (Claude sessions only). Each option
-/// is a profile to set, or `None` for the "clear tag" choice (fall back to the
-/// global default).
+/// Profile picker state for a session that has not been created yet.
+pub struct NewProfileState {
+    pub cwd: String,
+    pub agent: crate::session::Agent,
+    pub options: Vec<String>,
+    pub selected: usize,
+}
+
+/// State for the per-session profile picker. Supported for Claude (whose
+/// profiles map to `_claude_run_<name>` shell launchers) and Codex (whose
+/// profiles are native `--profile` config sections). Each option is a profile to
+/// set, or `None` for the "clear tag" choice (fall back to the global default).
 pub struct ProfileState {
     pub session_id: String,
+    pub agent: crate::session::Agent,
     pub options: Vec<Option<String>>,
     pub selected: usize,
 }
 
 /// What the title edit is for.
 pub enum TitleEditContext {
-    Rename { session_id: String },
-    NewSession { cwd: String },
+    Rename { session: Session },
+    NewSession { cwd: String, profile: String },
     Fork { session_id: String, cwd: String },
 }
 
@@ -257,6 +349,16 @@ pub struct TitleEditState {
     pub query: String,
     pub cursor: usize,
     pub return_mode: Mode,
+}
+
+fn same_session_record(a: &Session, b: &Session) -> bool {
+    if a.agent != b.agent || a.id != b.id {
+        return false;
+    }
+    match (&a.source_path, &b.source_path) {
+        (Some(a_path), Some(b_path)) => a_path == b_path,
+        _ => a.project_path == b.project_path,
+    }
 }
 
 /// State for the conversation viewer.
@@ -324,14 +426,19 @@ pub struct App {
     pub fork_state: Option<ForkState>,
     /// State for the new-session agent picker.
     pub new_session_state: Option<NewSessionState>,
+    /// State for the new-session profile picker.
+    pub new_profile_state: Option<NewProfileState>,
     /// Title being edited.
     pub title_edit: Option<TitleEditState>,
     /// Cached default claude profile label from `~/.claude-default-profile`.
     pub profile_label: Option<String>,
+    /// Cached default Codex profile label from `~/.codex-default-profile`.
+    pub codex_profile_label: Option<String>,
     /// State for the per-session profile picker.
     pub profile_state: Option<ProfileState>,
     /// Per-session profile tags (session id -> profile), loaded from the sidecar.
     pub session_profiles: HashMap<String, String>,
+    last_profile_refresh: Instant,
     /// When true, the list shows archived sessions (from the `*-archive`
     /// directories) instead of the live ones, and the only session action is
     /// restore.
@@ -383,11 +490,22 @@ impl App {
             move_state: None,
             fork_state: None,
             new_session_state: None,
+            new_profile_state: None,
             title_edit: None,
             profile_label: crate::router::profile_name(),
+            codex_profile_label: crate::router::codex_profile_name(),
             profile_state: None,
-            session_profiles: crate::router::load_session_profiles(&get_claude_home()),
+            session_profiles: {
+                // Merge the Claude and Codex profile maps: session ids are unique
+                // UUIDs across agents, so a single lookup table serves both.
+                let mut m = crate::router::load_session_profiles(&get_claude_home());
+                m.extend(crate::router::load_session_profiles(
+                    &crate::codex::get_codex_home(),
+                ));
+                m
+            },
             viewing_archived: false,
+            last_profile_refresh: Instant::now(),
         }
     }
 
@@ -668,7 +786,9 @@ impl App {
         let mut sessions = if self.viewing_archived {
             let mut s = crate::discovery::discover_archived_sessions(&claude_home);
             s.extend(crate::codex::discover_archived_codex_sessions(&codex_home));
-            s.extend(crate::cursor::discover_archived_cursor_sessions(&cursor_home));
+            s.extend(crate::cursor::discover_archived_cursor_sessions(
+                &cursor_home,
+            ));
             s
         } else {
             let mut s = crate::discovery::discover_sessions(&claude_home);
@@ -797,12 +917,16 @@ impl App {
         }
         let entry = &self.display_entries[display_idx];
         let session = self.display_session(entry).clone();
+        self.start_fork_session(session);
+    }
+
+    /// Start the fork picker for a session already open in the conversation view.
+    pub fn start_fork_session(&mut self, session: Session) {
         if session.cwd.is_empty() {
             self.set_status("Cannot fork: session has no working directory".to_string());
             return;
         }
-        // Offer the source agent first (a native fork where supported), then the
-        // other two agents (cross-agent reconstruct / context-seed).
+        // Offer the source agent first, then the other two agents.
         use crate::session::Agent;
         let all = [Agent::Claude, Agent::Codex, Agent::Cursor];
         let mut options = vec![session.agent];
@@ -815,23 +939,40 @@ impl App {
         self.mode = Mode::ForkSelectAgent;
     }
 
-    /// Start the per-session profile picker for the selected Claude session.
+    /// Start the per-session profile picker for the selected Claude or Codex
+    /// session. Claude offers its fixed launcher profiles; Codex offers whatever
+    /// it declares natively in `config.toml`.
     pub fn start_profile(&mut self, display_idx: usize) {
+        self.refresh_session_profiles();
         if display_idx >= self.display_entries.len() {
             return;
         }
         let entry = &self.display_entries[display_idx];
         let session = self.display_session(entry);
-        if session.agent != crate::session::Agent::Claude {
-            self.set_status("Profiles apply to Claude sessions only".to_string());
-            return;
-        }
+        let agent = session.agent;
+        let profile_names: Vec<String> = match agent {
+            crate::session::Agent::Claude => crate::router::PROFILES
+                .iter()
+                .map(|p| p.to_string())
+                .collect(),
+            crate::session::Agent::Codex => {
+                let names = crate::router::codex_config_profiles(&crate::codex::get_codex_home());
+                if names.is_empty() {
+                    self.set_status(
+                        "No Codex profiles found (create ~/.codex/<name>.config.toml)".to_string(),
+                    );
+                    return;
+                }
+                names
+            }
+            crate::session::Agent::Cursor => {
+                self.set_status("Profiles apply to Claude and Codex sessions only".to_string());
+                return;
+            }
+        };
         let session_id = session.id.clone();
         let current = self.session_profiles.get(&session_id).cloned();
-        let mut options: Vec<Option<String>> = crate::router::PROFILES
-            .iter()
-            .map(|p| Some(p.to_string()))
-            .collect();
+        let mut options: Vec<Option<String>> = profile_names.into_iter().map(Some).collect();
         options.push(None); // "clear" choice
         let selected = current
             .as_deref()
@@ -839,6 +980,7 @@ impl App {
             .unwrap_or(0);
         self.profile_state = Some(ProfileState {
             session_id,
+            agent,
             options,
             selected,
         });
@@ -852,9 +994,23 @@ impl App {
         };
         self.mode = Mode::Browsing;
         let choice = state.options.get(state.selected).cloned().flatten();
-        let claude_home = get_claude_home();
         let value = choice.as_deref().unwrap_or("");
-        match crate::router::save_session_profile(&claude_home, &state.session_id, value) {
+        // Persist to the home matching the session's agent: Claude tags live
+        // under the Claude home, Codex tags under the Codex home.
+        let saved = match state.agent {
+            crate::session::Agent::Codex => {
+                let codex_home = crate::codex::get_codex_home();
+                let known = crate::router::codex_config_profiles(&codex_home);
+                crate::router::save_codex_session_profile(
+                    &codex_home,
+                    &state.session_id,
+                    value,
+                    &known,
+                )
+            }
+            _ => crate::router::save_session_profile(&get_claude_home(), &state.session_id, value),
+        };
+        match saved {
             Ok(()) => match &choice {
                 Some(p) => {
                     self.session_profiles.insert(state.session_id, p.clone());
@@ -971,14 +1127,11 @@ impl App {
     }
 
     /// Start editing a title for the given session (rename).
-    pub fn start_title_edit(&mut self, session_id: String, return_mode: Mode) {
-        let existing = self
-            .find_session(&session_id)
-            .and_then(|s| s.custom_title.clone())
-            .unwrap_or_default();
+    pub fn start_title_edit(&mut self, session: Session, return_mode: Mode) {
+        let existing = session.custom_title.clone().unwrap_or_default();
         let cursor = existing.len();
         self.title_edit = Some(TitleEditState {
-            context: TitleEditContext::Rename { session_id },
+            context: TitleEditContext::Rename { session },
             query: existing,
             cursor,
             return_mode,
@@ -987,9 +1140,9 @@ impl App {
     }
 
     /// Start title input for a new session.
-    pub fn start_new_session_title(&mut self, cwd: String) {
+    pub fn start_new_session_title(&mut self, cwd: String, profile: String) {
         self.title_edit = Some(TitleEditState {
-            context: TitleEditContext::NewSession { cwd },
+            context: TitleEditContext::NewSession { cwd, profile },
             query: String::new(),
             cursor: 0,
             return_mode: Mode::Browsing,
@@ -1007,6 +1160,36 @@ impl App {
             selected: 0,
         });
         self.mode = Mode::NewSelectAgent;
+    }
+
+    /// Ask which profile a new Claude or Codex session should use.
+    pub fn start_new_session_profile(&mut self, agent: crate::session::Agent, cwd: String) {
+        let options: Vec<String> = match agent {
+            crate::session::Agent::Claude => crate::router::PROFILES
+                .iter()
+                .map(|profile| profile.to_string())
+                .collect(),
+            crate::session::Agent::Codex => {
+                crate::router::codex_config_profiles(&crate::codex::get_codex_home())
+            }
+            crate::session::Agent::Cursor => return,
+        };
+        if options.is_empty() {
+            self.set_status(format!("No {} profiles configured", agent.label()));
+            self.mode = Mode::Browsing;
+            return;
+        }
+        let selected = self
+            .default_profile_for_agent(agent)
+            .and_then(|default| options.iter().position(|profile| profile == default))
+            .unwrap_or(0);
+        self.new_profile_state = Some(NewProfileState {
+            cwd,
+            agent,
+            options,
+            selected,
+        });
+        self.mode = Mode::NewSelectProfile;
     }
 
     /// Start title input for forking a session.
@@ -1034,17 +1217,23 @@ impl App {
         let title = state.query.trim().to_string();
 
         match state.context {
-            TitleEditContext::Rename { session_id } => {
+            TitleEditContext::Rename { session } => {
+                let agent = session.agent;
+
                 if !title.is_empty() {
-                    let duplicate = self
-                        .sessions
-                        .iter()
-                        .chain(self.content_results.iter())
-                        .any(|s| s.id != session_id && s.custom_title.as_deref() == Some(&title));
+                    let duplicate =
+                        self.sessions
+                            .iter()
+                            .chain(self.content_results.iter())
+                            .any(|s| {
+                                s.agent == agent
+                                    && !same_session_record(s, &session)
+                                    && s.custom_title.as_deref() == Some(title.as_str())
+                            });
                     if duplicate {
                         let cursor = title.len();
                         self.title_edit = Some(TitleEditState {
-                            context: TitleEditContext::Rename { session_id },
+                            context: TitleEditContext::Rename { session },
                             query: title,
                             cursor,
                             return_mode: state.return_mode,
@@ -1054,57 +1243,67 @@ impl App {
                     }
                 }
 
-                let (project_path, agent) = self
-                    .find_session(&session_id)
-                    .map(|s| (s.project_path.clone(), s.agent))
-                    .ok_or("session not found")?;
-
                 match agent {
                     crate::session::Agent::Codex => {
-                        crate::codex::save_codex_title(
+                        let path = session
+                            .source_path
+                            .as_deref()
+                            .ok_or("Codex rollout path missing")?;
+                        crate::codex::save_codex_title_for_path(
                             &crate::codex::get_codex_home(),
-                            &session_id,
+                            std::path::Path::new(path),
                             &title,
                         )?;
                     }
                     crate::session::Agent::Claude => {
-                        crate::titles::save_custom_title(&project_path, &session_id, &title)?;
+                        crate::titles::save_custom_title(
+                            &session.project_path,
+                            &session.id,
+                            &title,
+                        )?;
                     }
                     crate::session::Agent::Cursor => {
                         crate::cursor::save_cursor_title(
                             &crate::cursor::get_cursor_home(),
-                            &session_id,
+                            &session.id,
                             &title,
                         )?;
                     }
                 }
                 self.update_session_title(
-                    &session_id,
+                    &session,
                     if title.is_empty() { None } else { Some(title) },
                 );
                 self.mode = state.return_mode;
                 Ok(None)
             }
-            TitleEditContext::NewSession { cwd } => {
+            TitleEditContext::NewSession { cwd, profile } => {
                 let escaped_cwd = cwd.replace('\'', "'\\''");
+                let launcher = crate::router::claude_launcher(Some(&profile));
 
                 if title.is_empty() {
                     self.mode = Mode::Browsing;
                     return Ok(Some(Action::NewSession {
-                        cmd: format!("cd '{}' && claude", escaped_cwd),
-                        title: None,
+                        cmd: format!("cd '{}' && {}", escaped_cwd, launcher),
+                        title: Some(crate::session::format_title_label(
+                            crate::session::Agent::Claude,
+                            "session",
+                            Some(&profile),
+                        )),
+                        agent: crate::session::Agent::Claude,
+                        profile: Some(profile),
+                        cwd,
                     }));
                 }
 
-                let duplicate = self
-                    .sessions
-                    .iter()
-                    .chain(self.content_results.iter())
-                    .any(|s| s.custom_title.as_deref() == Some(&title));
+                // A new session is always Claude, so uniqueness is scoped to
+                // Claude sessions; the same title on a Codex/Cursor session is
+                // intentional (cross-agent clustering) and must not block.
+                let duplicate = self.title_conflicts(&title, crate::session::Agent::Claude, None);
                 if duplicate {
                     let cursor = title.len();
                     self.title_edit = Some(TitleEditState {
-                        context: TitleEditContext::NewSession { cwd },
+                        context: TitleEditContext::NewSession { cwd, profile },
                         query: title,
                         cursor,
                         return_mode: state.return_mode,
@@ -1116,8 +1315,18 @@ impl App {
                 let escaped_title = title.replace('\'', "'\\''");
                 self.mode = Mode::Browsing;
                 Ok(Some(Action::NewSession {
-                    cmd: format!("cd '{}' && claude -n '{}'", escaped_cwd, escaped_title),
-                    title: Some(format!("Claude: {title}")),
+                    cmd: format!(
+                        "cd '{}' && {} -n '{}'",
+                        escaped_cwd, launcher, escaped_title
+                    ),
+                    title: Some(crate::session::format_title_label(
+                        crate::session::Agent::Claude,
+                        &title,
+                        Some(&profile),
+                    )),
+                    agent: crate::session::Agent::Claude,
+                    profile: Some(profile),
+                    cwd,
                 }))
             }
             TitleEditContext::Fork { session_id, cwd } => {
@@ -1126,7 +1335,9 @@ impl App {
                     self.session_profiles.get(&session_id).map(String::as_str),
                 );
                 if title.is_empty() {
-                    let tab_title = self.find_session(&session_id).map(|s| s.title_label());
+                    let tab_title = self
+                        .find_session(&session_id)
+                        .map(|s| self.session_terminal_title(s));
                     self.mode = state.return_mode;
                     return Ok(Some(Action::ForkSession {
                         cmd: format!(
@@ -1143,7 +1354,14 @@ impl App {
                         "cd '{}' && {} -r {} --fork-session -n '{}'",
                         escaped_cwd, launcher, session_id, escaped_title
                     ),
-                    title: Some(format!("Claude: {title}")),
+                    title: Some(crate::session::format_title_label(
+                        crate::session::Agent::Claude,
+                        &title,
+                        self.session_profiles
+                            .get(&session_id)
+                            .map(String::as_str)
+                            .or(self.profile_label.as_deref()),
+                    )),
                 }))
             }
         }
@@ -1164,6 +1382,51 @@ impl App {
             .unwrap_or_else(|| session.first_message.clone())
     }
 
+    /// Resolve the profile that will actually be used for a session. An
+    /// explicit per-session tag wins; otherwise the matching shell default is
+    /// used for Claude and Codex.
+    pub fn effective_session_profile<'a>(&'a self, session: &Session) -> Option<&'a str> {
+        self.session_profiles
+            .get(&session.id)
+            .map(String::as_str)
+            .or_else(|| self.default_profile_for_agent(session.agent))
+    }
+
+    /// Default profile for a newly created or transferred session.
+    pub fn default_profile_for_agent(&self, agent: crate::session::Agent) -> Option<&str> {
+        match agent {
+            crate::session::Agent::Claude => self.profile_label.as_deref(),
+            crate::session::Agent::Codex => self.codex_profile_label.as_deref(),
+            crate::session::Agent::Cursor => None,
+        }
+    }
+
+    /// Terminal title using the same provider, title, profile order as the list.
+    pub fn session_terminal_title(&self, session: &Session) -> String {
+        session.title_label_with_profile(self.effective_session_profile(session))
+    }
+
+    /// Whether `title` clashes with another session of the same `agent`. Title
+    /// uniqueness is scoped per provider on purpose: the same title across
+    /// different agents is intentional - it clusters a session with its
+    /// cross-agent clones - so only a same-agent match conflicts. `exclude_id`
+    /// skips the session being renamed.
+    fn title_conflicts(
+        &self,
+        title: &str,
+        agent: crate::session::Agent,
+        exclude_id: Option<&str>,
+    ) -> bool {
+        self.sessions
+            .iter()
+            .chain(self.content_results.iter())
+            .any(|s| {
+                s.agent == agent
+                    && Some(s.id.as_str()) != exclude_id
+                    && s.custom_title.as_deref() == Some(title)
+            })
+    }
+
     /// Find a session by ID across sessions and content_results.
     fn find_session(&self, session_id: &str) -> Option<&Session> {
         self.sessions
@@ -1173,15 +1436,42 @@ impl App {
     }
 
     /// Update custom_title on a session in memory.
-    fn update_session_title(&mut self, session_id: &str, title: Option<String>) {
+    fn update_session_title(&mut self, target: &Session, title: Option<String>) {
+        let selected_record = if self.grouped_view {
+            self.selected_tree_row().and_then(|row| match row {
+                TreeRow::Session { display_idx, .. } => Some(
+                    self.display_session(&self.display_entries[*display_idx])
+                        .clone(),
+                ),
+                TreeRow::Project(_) => None,
+            })
+        } else {
+            None
+        };
         for s in self
             .sessions
             .iter_mut()
             .chain(self.content_results.iter_mut())
         {
-            if s.id == session_id {
-                s.custom_title = title;
-                return;
+            if same_session_record(s, target) {
+                s.custom_title = title.clone();
+            }
+        }
+        if let Some(conversation) = &mut self.conversation {
+            if same_session_record(&conversation.session, target) {
+                conversation.session.custom_title = title;
+            }
+        }
+        self.rebuild_tree_rows();
+        if let Some(selected_record) = selected_record {
+            if let Some((index, _)) = self.tree_rows.iter().enumerate().find(|(_, row)| {
+                matches!(row, TreeRow::Session { display_idx, .. }
+                if same_session_record(
+                    self.display_session(&self.display_entries[*display_idx]),
+                    &selected_record
+                ))
+            }) {
+                self.selected = index;
             }
         }
     }
@@ -1270,8 +1560,25 @@ impl App {
         }
     }
 
-    /// Clear expired status messages.
+    /// Reload profile tags and defaults changed by another terminal.
+    pub fn refresh_session_profiles(&mut self) {
+        self.refresh_session_profiles_from(&get_claude_home(), &crate::codex::get_codex_home());
+        self.profile_label = crate::router::profile_name();
+        self.codex_profile_label = crate::router::codex_profile_name();
+    }
+
+    fn refresh_session_profiles_from(&mut self, claude_home: &Path, codex_home: &Path) {
+        let mut profiles = crate::router::load_session_profiles(claude_home);
+        profiles.extend(crate::router::load_session_profiles(codex_home));
+        self.session_profiles = profiles;
+        self.last_profile_refresh = Instant::now();
+    }
+
+    /// Refresh external profile changes and clear expired status messages.
     pub fn tick_status(&mut self) {
+        if self.last_profile_refresh.elapsed() >= Duration::from_millis(500) {
+            self.refresh_session_profiles();
+        }
         if let Some((_, when)) = &self.status_message {
             if when.elapsed() > Duration::from_secs(3) {
                 self.status_message = None;
@@ -1308,6 +1615,8 @@ pub fn run(
     let session_index = search::build_session_index(&claude_home, &sessions);
     let mut app = App::new(sessions, session_index, theme, grouped_view);
     let mut deferred_command: Option<(String, Option<String>)> = None;
+    let mut launch_warning: Option<String> = None;
+    let mut new_session_launch: Option<NewSessionLaunch> = None;
 
     loop {
         app.tick_status();
@@ -1333,10 +1642,35 @@ pub fn run(
                     Action::EnterConversation(idx) => {
                         app.enter_conversation(idx);
                     }
-                    Action::CopyCommand { cmd, title }
-                    | Action::NewSession { cmd, title }
-                    | Action::ForkSession { cmd, title }
-                    | Action::CloneSession { cmd, title } => {
+                    Action::NewSession {
+                        cmd,
+                        title,
+                        agent,
+                        profile,
+                        cwd,
+                    } => {
+                        if let Some(profile) = profile {
+                            let home = match agent {
+                                crate::session::Agent::Claude => get_claude_home(),
+                                crate::session::Agent::Codex => crate::codex::get_codex_home(),
+                                crate::session::Agent::Cursor => crate::cursor::get_cursor_home(),
+                            };
+                            new_session_launch =
+                                Some(NewSessionLaunch::new(agent, profile, cwd, home));
+                        }
+                        deferred_command = Some((cmd, title));
+                        break;
+                    }
+                    Action::CopyCommand { cmd, title } | Action::ForkSession { cmd, title } => {
+                        deferred_command = Some((cmd, title));
+                        break;
+                    }
+                    Action::CloneSession {
+                        cmd,
+                        title,
+                        warning,
+                    } => {
+                        launch_warning = warning;
                         deferred_command = Some((cmd, title));
                         break;
                     }
@@ -1381,23 +1715,220 @@ pub fn run(
 
     if let Some((cmd, title)) = deferred_command {
         use std::process::Command;
-        // Stamp the terminal tab with the session title so the launched agent is
-        // identifiable at a glance. The child agent (notably cursor-agent) may
-        // later set its own title; the Cursor seed prompt is shaped to carry the
-        // title into that generated name (see convert::seed_cursor_session).
-        if let Some(title) = title.as_deref().filter(|t| !t.is_empty()) {
-            let _ = execute!(std::io::stdout(), crossterm::terminal::SetTitle(title));
+        if let Some(warning) = launch_warning {
+            eprintln!("{warning}");
         }
+        // Stamp before starting the shell and again after its preexec hooks.
+        // Codex launches disable its own replacement; Cursor seed prompts also
+        // lead with this name.
+        let launch_cmd = if let Some(title) = title.as_deref().filter(|t| !t.is_empty()) {
+            let _ = execute!(std::io::stdout(), crossterm::terminal::SetTitle(title));
+            let escaped_title = title.replace('\'', "'\\''");
+            format!("printf '\\033]0;%s\\007' '{}' && {}", escaped_title, cmd)
+        } else {
+            cmd
+        };
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
-        let status = Command::new(&shell).arg("-ic").arg(&cmd).status();
+        let status = Command::new(&shell)
+            .arg("-ic")
+            .arg(&launch_cmd)
+            .spawn()
+            .and_then(|mut child| wait_for_agent(&mut child, new_session_launch.as_ref()));
         match status {
-            Ok(s) => std::process::exit(s.code().unwrap_or(1)),
+            Ok(s) => {
+                std::process::exit(s.code().unwrap_or(1));
+            }
             Err(e) => {
                 eprintln!("Failed to exec: {e}");
-                println!("{cmd}");
+                println!("{launch_cmd}");
             }
         }
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod title_conflict_tests {
+    use super::*;
+    use crate::session::{Agent, Session};
+    use crate::theme::Theme;
+    use chrono::Utc;
+
+    fn session(id: &str, agent: Agent, title: Option<&str>) -> Session {
+        Session {
+            id: id.into(),
+            project_path: "/tmp/proj".into(),
+            project_name: "proj".into(),
+            git_branch: None,
+            timestamp: Utc::now(),
+            first_message: "msg".into(),
+            cwd: "/tmp/proj".into(),
+            project_exists: false,
+            custom_title: title.map(str::to_string),
+            agent,
+            source_path: None,
+        }
+    }
+
+    fn app_with(sessions: Vec<Session>) -> App {
+        App::new(
+            sessions,
+            std::collections::HashMap::new(),
+            Theme::dark(),
+            true,
+        )
+    }
+
+    #[test]
+    fn profile_refresh_updates_labels_and_resume_commands_from_both_homes() {
+        let claude_home = tempfile::tempdir().unwrap();
+        let codex_home = tempfile::tempdir().unwrap();
+        let claude = session("claude-session", Agent::Claude, Some("Claude title"));
+        let codex = session("codex-session", Agent::Codex, Some("Codex title"));
+        let mut app = app_with(vec![claude.clone(), codex.clone()]);
+        app.profile_label = Some("work".into());
+        app.codex_profile_label = Some("work".into());
+        app.session_profiles
+            .insert(claude.id.clone(), "work".into());
+        app.session_profiles.insert(codex.id.clone(), "work".into());
+        crate::router::save_session_profile(claude_home.path(), &claude.id, "personal").unwrap();
+        let known = vec!["work".into(), "personal".into()];
+        crate::router::save_codex_session_profile(codex_home.path(), &codex.id, "personal", &known)
+            .unwrap();
+
+        app.refresh_session_profiles_from(claude_home.path(), codex_home.path());
+
+        for session in [&claude, &codex] {
+            assert_eq!(app.effective_session_profile(session), Some("personal"));
+            assert!(app.session_terminal_title(session).contains("personal"));
+            let profile = app.session_profiles.get(&session.id).map(String::as_str);
+            let command = session
+                .resume_command_with_profiles(&crate::router::claude_launcher(profile), profile);
+            assert!(command.contains(if session.agent == Agent::Codex {
+                "codex --profile personal"
+            } else {
+                "_claude_run_personal"
+            }));
+        }
+
+        crate::router::save_session_profile(claude_home.path(), &claude.id, "").unwrap();
+        crate::router::save_codex_session_profile(codex_home.path(), &codex.id, "work", &known)
+            .unwrap();
+        app.refresh_session_profiles_from(claude_home.path(), codex_home.path());
+
+        assert!(!app.session_profiles.contains_key(&claude.id));
+        assert_eq!(app.effective_session_profile(&claude), Some("work"));
+        assert_eq!(app.effective_session_profile(&codex), Some("work"));
+    }
+
+    #[test]
+    fn same_agent_same_title_conflicts() {
+        let app = app_with(vec![
+            session("a", Agent::Claude, Some("dev")),
+            session("b", Agent::Claude, Some("other")),
+        ]);
+        // Renaming session "b" to "dev" clashes with the Claude session "a".
+        assert!(app.title_conflicts("dev", Agent::Claude, Some("b")));
+    }
+
+    #[test]
+    fn cross_agent_same_title_is_allowed() {
+        let app = app_with(vec![
+            session("a", Agent::Codex, Some("dev")),
+            session("b", Agent::Claude, Some("other")),
+        ]);
+        // Renaming the Claude session "b" to "dev" must NOT clash with the Codex
+        // session that already carries "dev" - cross-agent titles cluster on
+        // purpose.
+        assert!(!app.title_conflicts("dev", Agent::Claude, Some("b")));
+    }
+
+    #[test]
+    fn excludes_self() {
+        let app = app_with(vec![session("a", Agent::Claude, Some("dev"))]);
+        // A session never conflicts with its own current title.
+        assert!(!app.title_conflicts("dev", Agent::Claude, Some("a")));
+    }
+
+    #[test]
+    fn new_claude_title_conflicts_only_with_claude() {
+        let app = app_with(vec![
+            session("a", Agent::Cursor, Some("dev")),
+            session("b", Agent::Claude, Some("taken")),
+        ]);
+        // New sessions are Claude: "dev" is free (only a Cursor holds it), but
+        // "taken" collides with an existing Claude session.
+        assert!(!app.title_conflicts("dev", Agent::Claude, None));
+        assert!(app.title_conflicts("taken", Agent::Claude, None));
+    }
+
+    #[test]
+    fn renaming_fork_keeps_original_title_and_selection() {
+        let mut app = app_with(vec![
+            session("original", Agent::Codex, Some("Agent Session")),
+            session("fork", Agent::Codex, Some("Agent Session (fork)")),
+        ]);
+        app.project_groups[0].expanded = true;
+        app.rebuild_tree_rows();
+        app.selected = app
+            .tree_rows
+            .iter()
+            .position(|row| {
+                matches!(row, TreeRow::Session { display_idx, .. }
+                    if app.display_session(&app.display_entries[*display_idx]).id == "fork")
+            })
+            .unwrap();
+        let fork_display_idx = match app.selected_tree_row() {
+            Some(TreeRow::Session { display_idx, .. }) => *display_idx,
+            _ => unreachable!(),
+        };
+        app.enter_conversation(fork_display_idx);
+
+        let fork = app.find_session("fork").unwrap().clone();
+        app.update_session_title(&fork, Some("Renamed fork".to_string()));
+
+        assert_eq!(
+            app.find_session("original")
+                .unwrap()
+                .custom_title
+                .as_deref(),
+            Some("Agent Session")
+        );
+        assert_eq!(
+            app.find_session("fork").unwrap().custom_title.as_deref(),
+            Some("Renamed fork")
+        );
+        assert_eq!(
+            app.conversation
+                .as_ref()
+                .unwrap()
+                .session
+                .custom_title
+                .as_deref(),
+            Some("Renamed fork")
+        );
+        assert!(
+            matches!(app.selected_tree_row(), Some(TreeRow::Session { display_idx, .. })
+            if app.display_session(&app.display_entries[*display_idx]).id == "fork")
+        );
+    }
+
+    #[test]
+    fn duplicate_codex_ids_in_different_projects_rename_only_selected_record() {
+        let mut first = session("shared-id", Agent::Codex, Some("Same title"));
+        first.project_path = "/tmp/first".into();
+        first.source_path = Some("/tmp/codex/sessions/2026/01/01/first.jsonl".into());
+        let mut second = session("shared-id", Agent::Codex, Some("Same title"));
+        second.project_path = "/tmp/second".into();
+        second.source_path = Some("/tmp/codex/sessions/2026/01/02/second.jsonl".into());
+        let mut app = app_with(vec![first, second.clone()]);
+
+        app.start_title_edit(second.clone(), Mode::Browsing);
+        assert_eq!(app.title_edit.as_ref().unwrap().query, "Same title");
+        app.update_session_title(&second, Some("Only second".into()));
+
+        assert_eq!(app.sessions[0].custom_title.as_deref(), Some("Same title"));
+        assert_eq!(app.sessions[1].custom_title.as_deref(), Some("Only second"));
+    }
 }

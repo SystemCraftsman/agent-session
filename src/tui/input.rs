@@ -43,7 +43,6 @@ fn current_selection_cwd(app: &App) -> Option<String> {
     }
 }
 
-
 /// Handle a key event and return the resulting action.
 pub fn handle_input(app: &mut App, key: KeyEvent) -> Action {
     // Ctrl-C always quits
@@ -59,6 +58,7 @@ pub fn handle_input(app: &mut App, key: KeyEvent) -> Action {
         Mode::MoveSelectProject => handle_move_select(app, key),
         Mode::ForkSelectAgent => handle_fork_select(app, key),
         Mode::NewSelectAgent => handle_new_agent_select(app, key),
+        Mode::NewSelectProfile => handle_new_profile_select(app, key),
         Mode::ProfileSelect => handle_profile_select(app, key),
         Mode::TitleEdit => handle_title_edit(app, key),
     }
@@ -235,8 +235,8 @@ fn handle_browse(app: &mut App, key: KeyEvent) -> Action {
             if ctrl && c == 't' {
                 if let Some(idx) = current_selection_idx(app) {
                     let entry = &app.display_entries[idx];
-                    let session_id = app.display_session(entry).id.clone();
-                    app.start_title_edit(session_id, Mode::Browsing);
+                    let session = app.display_session(entry).clone();
+                    app.start_title_edit(session, Mode::Browsing);
                 }
                 return Action::Continue;
             }
@@ -359,16 +359,19 @@ fn handle_conversation(app: &mut App, key: KeyEvent) -> Action {
         }
         KeyCode::Char('t') => {
             if let Some(conv) = &app.conversation {
-                let session_id = conv.session.id.clone();
-                app.start_title_edit(session_id, Mode::Conversation);
+                let session = conv.session.clone();
+                app.start_title_edit(session, Mode::Conversation);
             }
             Action::Continue
         }
         KeyCode::Char('f') => {
             if let Some(conv) = &app.conversation {
-                let session_id = conv.session.id.clone();
-                let cwd = conv.session.cwd.clone();
-                app.start_fork_title(session_id, cwd);
+                let session = conv.session.clone();
+                if session.agent == crate::session::Agent::Claude {
+                    app.start_fork_title(session.id, session.cwd);
+                } else {
+                    app.start_fork_session(session);
+                }
             }
             Action::Continue
         }
@@ -394,16 +397,19 @@ fn handle_conversation(app: &mut App, key: KeyEvent) -> Action {
             Action::Continue
         }
         KeyCode::Enter => {
+            app.refresh_session_profiles();
             if let Some(conv) = &app.conversation {
-                let launcher = crate::router::claude_launcher(
-                    app.session_profiles
-                        .get(&conv.session.id)
-                        .map(String::as_str),
-                );
-                let cmd = conv.session.resume_command_with(&launcher);
+                let profile = app
+                    .session_profiles
+                    .get(&conv.session.id)
+                    .map(String::as_str);
+                let launcher = crate::router::claude_launcher(profile);
+                let cmd = conv
+                    .session
+                    .resume_command_with_profiles(&launcher, profile);
                 Action::CopyCommand {
                     cmd,
-                    title: Some(conv.session.title_label()),
+                    title: Some(app.session_terminal_title(&conv.session)),
                 }
             } else {
                 Action::Continue
@@ -516,6 +522,7 @@ fn handle_fork_select(app: &mut App, key: KeyEvent) -> Action {
             Action::Continue
         }
         KeyCode::Enter => {
+            app.refresh_session_profiles();
             let Some(state) = app.fork_state.take() else {
                 app.mode = Mode::Browsing;
                 return Action::Continue;
@@ -523,30 +530,72 @@ fn handle_fork_select(app: &mut App, key: KeyEvent) -> Action {
             app.mode = Mode::Browsing;
             let target = state.options[state.selected];
             let session = state.session;
-            // Claude and Codex have a native same-agent fork; Cursor does not,
-            // so a Cursor->Cursor "fork" is context-seeded like any Cursor target.
-            let native_fork = target == session.agent
-                && matches!(
-                    session.agent,
-                    crate::session::Agent::Claude | crate::session::Agent::Codex
-                );
-            if native_fork {
-                let launcher = crate::router::claude_launcher(
-                    app.session_profiles.get(&session.id).map(String::as_str),
-                );
+            // Only Claude uses its CLI's native fork. Codex gets a new rollout
+            // ID through reconstruction; Cursor starts a context-seeded chat.
+            if target == session.agent && session.agent == crate::session::Agent::Claude {
+                let profile = app.session_profiles.get(&session.id).map(String::as_str);
+                let launcher = crate::router::claude_launcher(profile);
                 Action::ForkSession {
-                    cmd: native_fork_command(&session, &launcher),
-                    title: Some(session.title_label()),
+                    cmd: claude_fork_command(&session, &launcher),
+                    title: Some(app.session_terminal_title(&session)),
                 }
             } else {
                 // Reconstruct (Claude/Codex targets) or context-seed (Cursor).
-                let tab_title = session.title_label();
+                let codex_profile = if session.agent == crate::session::Agent::Codex
+                    && target == crate::session::Agent::Codex
+                {
+                    app.effective_session_profile(&session).map(str::to_string)
+                } else {
+                    None
+                };
                 match crate::convert::clone_to_other_agent(&session, target) {
                     Ok(result) => {
+                        let mut cmd = result.resume_command;
+                        let codex_home = crate::codex::get_codex_home();
+                        let known_profiles = if codex_profile.is_some() {
+                            crate::router::codex_config_profiles(&codex_home)
+                        } else {
+                            Vec::new()
+                        };
+                        let profile = codex_profile
+                            .as_deref()
+                            .filter(|profile| known_profiles.iter().any(|known| known == *profile));
+                        let mut warning = if codex_profile.is_some() && profile.is_none() {
+                            Some(
+                                "Codex fork profile is no longer configured; using the default"
+                                    .to_string(),
+                            )
+                        } else {
+                            None
+                        };
+                        if let Some(profile) = profile {
+                            if let Err(error) = crate::router::save_codex_session_profile(
+                                &codex_home,
+                                &result.new_id,
+                                profile,
+                                &known_profiles,
+                            ) {
+                                warning = Some(format!(
+                                    "Codex fork created, but its profile tag was not saved: {error}"
+                                ));
+                            }
+                            let cwd = session.cwd.replace('\'', "'\\''");
+                            let quoted_profile = profile.replace('\'', "'\\''");
+                            cmd = format!(
+                                "cd '{cwd}' && codex --profile '{quoted_profile}' -c 'tui.terminal_title=[]' resume {}",
+                                result.new_id
+                            );
+                        }
+                        let tab_title = crate::session::format_title_label(
+                            target,
+                            &result.title,
+                            profile.or_else(|| app.default_profile_for_agent(target)),
+                        );
                         app.set_status(format!("Forking into new session {}", result.new_id));
                         Action::CloneSession {
-                            cmd: result.resume_command,
+                            cmd,
                             title: Some(tab_title),
+                            warning,
                         }
                     }
                     Err(e) => {
@@ -591,26 +640,22 @@ fn handle_new_agent_select(app: &mut App, key: KeyEvent) -> Action {
             let cwd = state.cwd;
             let escaped_cwd = cwd.replace('\'', "'\\''");
             match agent {
-                // Claude supports a session-name flag, so prompt for a title
-                // first; the title-edit flow builds and launches the command.
-                crate::session::Agent::Claude => {
-                    app.start_new_session_title(cwd);
+                crate::session::Agent::Claude | crate::session::Agent::Codex => {
+                    app.start_new_session_profile(agent, cwd);
                     Action::Continue
-                }
-                // Codex and Cursor have no new-session title flag, so launch
-                // directly. A generic label keeps the terminal tab readable.
-                crate::session::Agent::Codex => {
-                    app.mode = Mode::Browsing;
-                    Action::NewSession {
-                        cmd: format!("cd '{escaped_cwd}' && codex"),
-                        title: Some("Codex session".to_string()),
-                    }
                 }
                 crate::session::Agent::Cursor => {
                     app.mode = Mode::Browsing;
                     Action::NewSession {
                         cmd: format!("cd '{escaped_cwd}' && cursor-agent"),
-                        title: Some("Cursor session".to_string()),
+                        title: Some(crate::session::format_title_label(
+                            crate::session::Agent::Cursor,
+                            "session",
+                            None,
+                        )),
+                        agent: crate::session::Agent::Cursor,
+                        profile: None,
+                        cwd,
                     }
                 }
             }
@@ -625,6 +670,67 @@ fn handle_new_agent_select(app: &mut App, key: KeyEvent) -> Action {
         }
         KeyCode::Up | KeyCode::Char('k') => {
             if let Some(state) = &mut app.new_session_state {
+                state.selected = state.selected.saturating_sub(1);
+            }
+            Action::Continue
+        }
+        _ => Action::Continue,
+    }
+}
+
+/// Handle profile selection while creating a new Claude or Codex session.
+fn handle_new_profile_select(app: &mut App, key: KeyEvent) -> Action {
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('q') => {
+            let cwd = app.new_profile_state.take().map(|state| state.cwd);
+            if let Some(cwd) = cwd {
+                app.start_new_session(cwd);
+            } else {
+                app.mode = Mode::Browsing;
+            }
+            Action::Continue
+        }
+        KeyCode::Enter => {
+            let Some(state) = app.new_profile_state.take() else {
+                app.mode = Mode::Browsing;
+                return Action::Continue;
+            };
+            let profile = state.options[state.selected].clone();
+            match state.agent {
+                crate::session::Agent::Claude => {
+                    app.start_new_session_title(state.cwd, profile);
+                    Action::Continue
+                }
+                crate::session::Agent::Codex => {
+                    let escaped_cwd = state.cwd.replace('\'', "'\\''");
+                    app.mode = Mode::Browsing;
+                    Action::NewSession {
+                        cmd: format!(
+                            "cd '{escaped_cwd}' && codex --profile {profile} -c 'tui.terminal_title=[]'"
+                        ),
+                        title: Some(crate::session::format_title_label(
+                            crate::session::Agent::Codex,
+                            "session",
+                            Some(&profile),
+                        )),
+                        agent: crate::session::Agent::Codex,
+                        profile: Some(profile),
+                        cwd: state.cwd,
+                    }
+                }
+                crate::session::Agent::Cursor => Action::Continue,
+            }
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            if let Some(state) = &mut app.new_profile_state {
+                if state.selected + 1 < state.options.len() {
+                    state.selected += 1;
+                }
+            }
+            Action::Continue
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            if let Some(state) = &mut app.new_profile_state {
                 state.selected = state.selected.saturating_sub(1);
             }
             Action::Continue
@@ -663,25 +769,13 @@ fn handle_profile_select(app: &mut App, key: KeyEvent) -> Action {
     }
 }
 
-/// Build the shell command for a native (same-agent) fork of `session`.
-/// `claude_launcher` is `claude` or a `_claude_run_<profile>` shell function so
-/// a Claude fork inherits the session's tagged profile.
-fn native_fork_command(session: &crate::session::Session, claude_launcher: &str) -> String {
+/// Claude's same-agent fork uses the selected shell launcher and profile.
+fn claude_fork_command(session: &crate::session::Session, claude_launcher: &str) -> String {
     let cwd = session.cwd.replace('\'', "'\\''");
-    match session.agent {
-        crate::session::Agent::Claude => {
-            format!(
-                "cd '{}' && {} -r {} --fork-session",
-                cwd, claude_launcher, session.id
-            )
-        }
-        crate::session::Agent::Codex => {
-            format!("cd '{}' && codex fork {}", cwd, session.id)
-        }
-        // Cursor has no native fork; the caller routes Cursor targets through
-        // context seeding, so this is only a defensive fallback.
-        crate::session::Agent::Cursor => session.resume_command(),
-    }
+    format!(
+        "cd '{}' && {} -r {} --fork-session",
+        cwd, claude_launcher, session.id
+    )
 }
 
 fn handle_move_select(app: &mut App, key: KeyEvent) -> Action {

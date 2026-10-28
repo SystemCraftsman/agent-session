@@ -11,7 +11,11 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 fn profile_name_at(home: &Path) -> Option<String> {
-    let raw = fs::read_to_string(home.join(".claude-default-profile")).ok()?;
+    profile_name_from(home, ".claude-default-profile")
+}
+
+fn profile_name_from(home: &Path, file_name: &str) -> Option<String> {
+    let raw = fs::read_to_string(home.join(file_name)).ok()?;
     let name = raw.trim();
     if name.is_empty() {
         None
@@ -24,6 +28,11 @@ fn profile_name_at(home: &Path) -> Option<String> {
 /// or `None` when the file is absent or empty.
 pub fn profile_name() -> Option<String> {
     profile_name_at(&dirs::home_dir()?)
+}
+
+/// Codex default profile from the user's shell launcher state file.
+pub fn codex_profile_name() -> Option<String> {
+    profile_name_from(&dirs::home_dir()?, ".codex-default-profile")
 }
 
 /// Known per-session profiles, matching the user's `_claude_run_<name>` shell
@@ -63,6 +72,58 @@ pub fn save_session_profile(claude_home: &Path, id: &str, profile: &str) -> std:
     fs::write(session_profiles_path(claude_home), json)
 }
 
+/// Profile names Codex defines natively. Since Codex v0.153 each profile lives
+/// in its own `~/.codex/<name>.config.toml` file (layered over the base
+/// `config.toml`) rather than in `[profiles.<name>]` sections. We list those
+/// files and return the `<name>` parts, sorted and de-duplicated; empty when the
+/// directory is absent or defines none. The base `config.toml` is not a profile
+/// and is skipped automatically (its name has no prefix before `.config.toml`).
+pub fn codex_config_profiles(codex_home: &Path) -> Vec<String> {
+    let Ok(entries) = fs::read_dir(codex_home) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = Vec::new();
+    for entry in entries.flatten() {
+        let file_name = entry.file_name();
+        let Some(file_name) = file_name.to_str() else {
+            continue;
+        };
+        if let Some(name) = file_name.strip_suffix(".config.toml") {
+            if !name.is_empty() && !names.iter().any(|n| n == name) {
+                names.push(name.to_string());
+            }
+        }
+    }
+    names.sort();
+    names
+}
+
+/// Tag a Codex `id` with a native `profile`, or clear the tag when empty. The
+/// accepted set is whatever the user declared in `config.toml` (passed as
+/// `known`), since Codex profiles are user-defined rather than a fixed list.
+/// The Codex map shares the same `agent-session-profiles.json` filename but
+/// lives under the Codex home, so [`load_session_profiles`] reads it too.
+pub fn save_codex_session_profile(
+    codex_home: &Path,
+    id: &str,
+    profile: &str,
+    known: &[String],
+) -> std::io::Result<()> {
+    let mut map = load_session_profiles(codex_home);
+    if profile.is_empty() {
+        map.remove(id);
+    } else if known.iter().any(|k| k == profile) {
+        map.insert(id.to_string(), profile.to_string());
+    } else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "unknown codex profile",
+        ));
+    }
+    let json = serde_json::to_string_pretty(&map).unwrap_or_else(|_| "{}".to_string());
+    fs::write(session_profiles_path(codex_home), json)
+}
+
 /// Shell launcher for a Claude resume command: the user's `_claude_run_<profile>`
 /// function for a tagged session, or plain `claude` (which honors the global
 /// default) when untagged or the tag is unknown.
@@ -87,5 +148,66 @@ mod tests {
 
         fs::write(tmp.path().join(".claude-default-profile"), "   ").unwrap();
         assert_eq!(profile_name_at(tmp.path()), None, "empty => hidden");
+    }
+
+    #[test]
+    fn codex_default_profile_uses_its_shell_state_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join(".codex-default-profile"), "work\n").unwrap();
+        assert_eq!(
+            profile_name_from(tmp.path(), ".codex-default-profile").as_deref(),
+            Some("work")
+        );
+    }
+
+    #[test]
+    fn codex_config_profiles_lists_profile_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(
+            codex_config_profiles(tmp.path()).is_empty(),
+            "no dir entries => none"
+        );
+
+        // Codex v0.153+: the base config.toml is not a profile; each profile is a
+        // separate `<name>.config.toml` file layered over the base.
+        fs::write(tmp.path().join("config.toml"), "model = \"gpt-5.6-sol\"\n").unwrap();
+        fs::write(
+            tmp.path().join("work.config.toml"),
+            "model = \"gpt-5.6-sol\"\n",
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("personal.config.toml"),
+            "model = \"gpt-5.6-sol\"\n",
+        )
+        .unwrap();
+
+        // Sorted, de-duplicated, base config.toml excluded.
+        assert_eq!(
+            codex_config_profiles(tmp.path()),
+            vec!["personal".to_string(), "work".to_string()]
+        );
+    }
+
+    #[test]
+    fn save_codex_session_profile_validates_and_clears() {
+        let tmp = tempfile::tempdir().unwrap();
+        let known = vec!["work".to_string(), "personal".to_string()];
+
+        // Unknown profile is rejected.
+        assert!(save_codex_session_profile(tmp.path(), "id-1", "bogus", &known).is_err());
+
+        // Known profile persists and round-trips through the shared loader.
+        save_codex_session_profile(tmp.path(), "id-1", "work", &known).unwrap();
+        assert_eq!(
+            load_session_profiles(tmp.path())
+                .get("id-1")
+                .map(String::as_str),
+            Some("work")
+        );
+
+        // Empty clears the tag.
+        save_codex_session_profile(tmp.path(), "id-1", "", &known).unwrap();
+        assert!(!load_session_profiles(tmp.path()).contains_key("id-1"));
     }
 }

@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use agent_session::convert::clone_to_other_agent;
 use agent_session::cursor::{
@@ -243,6 +243,109 @@ fn seeds_new_cursor_chat_from_claude() {
     // The labeled title is embedded in the import doc for context. A Cursor
     // target is context-seeded, so a cross-agent copy carries a "(seed)" suffix.
     assert!(doc.contains("Refactor the payment module. (seed)"));
+
+    std::env::remove_var("CLAUDE_HOME");
+    std::env::remove_var("CURSOR_HOME");
+    std::env::remove_var("CC_SESSION_NO_CURSOR_CREATE");
+}
+
+/// Recursively collect every regular file under `dir`.
+fn files_under(dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                out.extend(files_under(&p));
+            } else {
+                out.push(p);
+            }
+        }
+    }
+    out
+}
+
+#[test]
+#[serial]
+fn reconstructed_codex_session_carries_claude_memories() {
+    let claude_home = tempfile::tempdir().unwrap();
+    let codex_home = tempfile::tempdir().unwrap();
+    std::env::set_var("CLAUDE_HOME", claude_home.path());
+    std::env::set_var("CODEX_HOME", codex_home.path());
+
+    let cwd = "/tmp/clone-proj-claude-to-codex-mem";
+    let source = write_claude_source(claude_home.path(), cwd);
+
+    let proj = claude_home.path().join("projects").join(encode_claude(cwd));
+    let mem_dir = proj.join("memory");
+    std::fs::create_dir_all(&mem_dir).unwrap();
+    std::fs::write(
+        mem_dir.join("constraint.md"),
+        "The payment module must stay backwards compatible.\n",
+    )
+    .unwrap();
+
+    clone_to_other_agent(&source, Agent::Codex).expect("reconstruct succeeds");
+
+    // The reconstructed rollout embeds the carried-over memory as a leading turn.
+    let rollout = files_under(&codex_home.path().join("sessions"))
+        .into_iter()
+        .find(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .map(|n| n.starts_with("rollout-") && n.ends_with(".jsonl"))
+                .unwrap_or(false)
+        })
+        .expect("codex rollout written");
+    let body = std::fs::read_to_string(&rollout).unwrap();
+    assert!(body.contains("Context carried over from the prior Claude session"));
+    assert!(body.contains("The payment module must stay backwards compatible."));
+    assert!(body.contains("Refactor the payment module."));
+
+    std::env::remove_var("CLAUDE_HOME");
+    std::env::remove_var("CODEX_HOME");
+}
+
+#[test]
+#[serial]
+fn seeded_cursor_chat_carries_claude_memories() {
+    let claude_home = tempfile::tempdir().unwrap();
+    let cursor_home = tempfile::tempdir().unwrap();
+    std::env::set_var("CLAUDE_HOME", claude_home.path());
+    std::env::set_var("CURSOR_HOME", cursor_home.path());
+    std::env::set_var("CC_SESSION_NO_CURSOR_CREATE", "1");
+
+    let cwd = "/tmp/clone-proj-claude-memories";
+    let source = write_claude_source(claude_home.path(), cwd);
+
+    // Seed the project's Claude memories: a MEMORY.md index plus a memory/ fact.
+    let proj = claude_home.path().join("projects").join(encode_claude(cwd));
+    std::fs::write(
+        proj.join("MEMORY.md"),
+        "- [User Profile](user.md) - prefers async refactors\n",
+    )
+    .unwrap();
+    let mem_dir = proj.join("memory");
+    std::fs::create_dir_all(&mem_dir).unwrap();
+    std::fs::write(
+        mem_dir.join("user.md"),
+        "---\nname: user\n---\n\nThe payment module must stay backwards compatible.\n",
+    )
+    .unwrap();
+
+    let result = clone_to_other_agent(&source, Agent::Cursor).expect("seed succeeds");
+
+    let import = cursor_home
+        .path()
+        .join("agent-session-imports")
+        .join(format!("{}.md", result.new_id));
+    let doc = std::fs::read_to_string(&import).expect("import file written");
+
+    // The transcript is still there, and now so are the carried-over memories.
+    assert!(doc.contains("Refactor the payment module."));
+    assert!(doc.contains("Memories carried over from Claude"));
+    assert!(doc.contains("prefers async refactors"));
+    assert!(doc.contains("The payment module must stay backwards compatible."));
 
     std::env::remove_var("CLAUDE_HOME");
     std::env::remove_var("CURSOR_HOME");

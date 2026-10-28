@@ -5,9 +5,13 @@ use std::path::PathBuf;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use serial_test::serial;
 
+use agent_session::codex::discover_codex_sessions;
 use agent_session::discovery::discover_sessions;
+use agent_session::session::Agent;
 use agent_session::theme::Theme;
-use agent_session::tui::{input::handle_input, Action, App, Mode, TreeRow};
+use agent_session::tui::{
+    input::handle_input, Action, App, ForkState, Mode, NewProfileState, TitleEditContext, TreeRow,
+};
 
 fn fixture_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
@@ -40,6 +44,141 @@ fn key_ctrl(c: char) -> KeyEvent {
 }
 
 #[test]
+fn new_claude_session_selects_profile_before_title() {
+    let mut app = make_app(false);
+    app.profile_label = Some("work".to_string());
+    app.start_new_session("/tmp/new-project".to_string());
+
+    handle_input(&mut app, key(KeyCode::Enter));
+    assert_eq!(app.mode, Mode::NewSelectProfile);
+    let state = app.new_profile_state.as_ref().expect("profile picker");
+    assert_eq!(state.agent, Agent::Claude);
+    assert_eq!(state.options, vec!["work", "personal"]);
+    assert_eq!(state.selected, 0);
+
+    handle_input(&mut app, key(KeyCode::Down));
+    handle_input(&mut app, key(KeyCode::Enter));
+    assert_eq!(app.mode, Mode::TitleEdit);
+    assert!(matches!(
+        app.title_edit.as_ref().map(|state| &state.context),
+        Some(TitleEditContext::NewSession { profile, .. }) if profile == "personal"
+    ));
+
+    let edit = app.title_edit.as_mut().expect("title edit");
+    edit.query = "New Claude Session".to_string();
+    edit.cursor = edit.query.len();
+    let action = handle_input(&mut app, key(KeyCode::Enter));
+    match action {
+        Action::NewSession {
+            cmd,
+            title,
+            agent,
+            profile,
+            cwd,
+        } => {
+            assert!(cmd.contains("_claude_run_personal -n 'New Claude Session'"));
+            assert_eq!(
+                title.as_deref(),
+                Some("[CLAUDE] New Claude Session [personal]")
+            );
+            assert_eq!(agent, Agent::Claude);
+            assert_eq!(profile.as_deref(), Some("personal"));
+            assert_eq!(cwd, "/tmp/new-project");
+        }
+        _ => panic!("expected new session action"),
+    }
+}
+
+#[test]
+fn new_codex_session_launches_with_selected_profile() {
+    let mut app = make_app(false);
+    app.new_profile_state = Some(NewProfileState {
+        cwd: "/tmp/new-project".to_string(),
+        agent: Agent::Codex,
+        options: vec!["work".to_string(), "personal".to_string()],
+        selected: 1,
+    });
+    app.mode = Mode::NewSelectProfile;
+
+    let action = handle_input(&mut app, key(KeyCode::Enter));
+    match action {
+        Action::NewSession {
+            cmd,
+            title,
+            agent,
+            profile,
+            cwd,
+        } => {
+            assert!(cmd.contains("codex --profile personal"));
+            assert!(cmd.contains("tui.terminal_title=[]"));
+            assert_eq!(title.as_deref(), Some("[CODEX] session [personal]"));
+            assert_eq!(agent, Agent::Codex);
+            assert_eq!(profile.as_deref(), Some("personal"));
+            assert_eq!(cwd, "/tmp/new-project");
+        }
+        _ => panic!("expected new session action"),
+    }
+}
+
+#[test]
+fn new_profile_escape_returns_to_agent_picker() {
+    let mut app = make_app(false);
+    app.new_profile_state = Some(NewProfileState {
+        cwd: "/tmp/new-project".to_string(),
+        agent: Agent::Claude,
+        options: vec!["work".to_string(), "personal".to_string()],
+        selected: 0,
+    });
+    app.mode = Mode::NewSelectProfile;
+
+    handle_input(&mut app, key(KeyCode::Esc));
+    assert_eq!(app.mode, Mode::NewSelectAgent);
+    assert!(app.new_session_state.is_some());
+}
+
+#[test]
+fn codex_fork_uses_clone_path_not_native_fork() {
+    let home = fixture_dir().join("codex");
+    let source = discover_codex_sessions(&home)
+        .into_iter()
+        .find(|s| s.id == "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
+        .unwrap();
+    let mut source = source;
+    source.source_path = None;
+    let mut app = make_app(false);
+    app.fork_state = Some(ForkState {
+        session: source.clone(),
+        options: vec![Agent::Codex],
+        selected: 0,
+    });
+    app.mode = Mode::ForkSelectAgent;
+
+    assert!(matches!(
+        handle_input(&mut app, key(KeyCode::Enter)),
+        Action::Continue
+    ));
+    assert!(app
+        .status_message
+        .as_ref()
+        .is_some_and(|(message, _)| message.contains("source conversation is empty")));
+}
+
+#[test]
+fn codex_conversation_fork_opens_fork_picker() {
+    let source = discover_codex_sessions(&fixture_dir().join("codex"))
+        .into_iter()
+        .next()
+        .unwrap();
+    let mut app = App::new(vec![source], HashMap::new(), Theme::dark(), false);
+    app.enter_conversation(0);
+
+    handle_input(&mut app, key(KeyCode::Char('f')));
+
+    assert_eq!(app.mode, Mode::ForkSelectAgent);
+    assert_eq!(app.fork_state.as_ref().unwrap().options[0], Agent::Codex);
+}
+
+#[test]
 fn tab_toggles_grouped_view() {
     let mut app = make_app(true);
     assert!(app.grouped_view);
@@ -62,11 +201,17 @@ fn enter_on_project_toggles_expand() {
     app.selected = 0;
     let action = handle_input(&mut app, key(KeyCode::Enter));
     assert!(matches!(action, Action::Continue));
-    assert!(app.project_groups[0].expanded, "Enter should expand project");
+    assert!(
+        app.project_groups[0].expanded,
+        "Enter should expand project"
+    );
 
     let action = handle_input(&mut app, key(KeyCode::Enter));
     assert!(matches!(action, Action::Continue));
-    assert!(!app.project_groups[0].expanded, "Enter should collapse project");
+    assert!(
+        !app.project_groups[0].expanded,
+        "Enter should collapse project"
+    );
 }
 
 #[test]
@@ -91,7 +236,10 @@ fn left_arrow_collapses_project() {
     assert!(app.project_groups[0].expanded);
 
     handle_input(&mut app, key(KeyCode::Left));
-    assert!(!app.project_groups[0].expanded, "Left should collapse expanded project");
+    assert!(
+        !app.project_groups[0].expanded,
+        "Left should collapse expanded project"
+    );
 }
 
 #[test]
@@ -101,7 +249,10 @@ fn left_arrow_on_collapsed_project_is_noop() {
     assert!(!app.project_groups[0].expanded);
 
     handle_input(&mut app, key(KeyCode::Left));
-    assert!(!app.project_groups[0].expanded, "Left on collapsed project should be noop");
+    assert!(
+        !app.project_groups[0].expanded,
+        "Left on collapsed project should be noop"
+    );
 }
 
 #[test]
@@ -111,7 +262,10 @@ fn right_arrow_expands_project() {
     assert!(!app.project_groups[0].expanded);
 
     handle_input(&mut app, key(KeyCode::Right));
-    assert!(app.project_groups[0].expanded, "Right should expand collapsed project");
+    assert!(
+        app.project_groups[0].expanded,
+        "Right should expand collapsed project"
+    );
 }
 
 #[test]
@@ -121,17 +275,26 @@ fn right_arrow_on_expanded_project_is_noop() {
     assert!(app.project_groups[0].expanded);
 
     handle_input(&mut app, key(KeyCode::Right));
-    assert!(app.project_groups[0].expanded, "Right on expanded project should be noop");
+    assert!(
+        app.project_groups[0].expanded,
+        "Right on expanded project should be noop"
+    );
 }
 
 #[test]
 fn left_arrow_on_session_jumps_to_parent_project() {
     let mut app = make_app_expanded();
     app.selected = 2;
-    assert!(matches!(app.tree_rows[2], TreeRow::Session { project_idx: 0, .. }));
+    assert!(matches!(
+        app.tree_rows[2],
+        TreeRow::Session { project_idx: 0, .. }
+    ));
 
     handle_input(&mut app, key(KeyCode::Left));
-    assert_eq!(app.selected, 0, "Left on session should jump to parent project");
+    assert_eq!(
+        app.selected, 0,
+        "Left on session should jump to parent project"
+    );
     assert!(matches!(app.tree_rows[0], TreeRow::Project(0)));
 }
 
@@ -266,7 +429,10 @@ fn a_key_ignored_when_filter_active() {
 
     let action = handle_input(&mut app, key(KeyCode::Char('a')));
     assert!(matches!(action, Action::Continue));
-    assert!(app.archive_confirm.is_none(), "should not trigger archive when filtering");
+    assert!(
+        app.archive_confirm.is_none(),
+        "should not trigger archive when filtering"
+    );
 }
 
 #[test]
@@ -326,7 +492,8 @@ fn archive_session_moves_file() {
 
     assert!(!session_file.exists(), "original file should be moved");
 
-    let archive_file = tmp.path()
+    let archive_file = tmp
+        .path()
         .join("projects-archive")
         .join("-Users-test-myproject")
         .join(format!("{session_id}.jsonl"));
@@ -354,7 +521,10 @@ fn m_key_ignored_when_filter_active() {
 
     let action = handle_input(&mut app, key(KeyCode::Char('m')));
     assert!(matches!(action, Action::Continue));
-    assert!(app.move_state.is_none(), "should not start move when filtering");
+    assert!(
+        app.move_state.is_none(),
+        "should not start move when filtering"
+    );
 }
 
 #[test]
@@ -440,15 +610,22 @@ fn move_session_moves_file() {
 
     assert!(!session_file.exists(), "original file should be gone");
 
-    let moved_file = tmp.path()
+    let moved_file = tmp
+        .path()
         .join("projects")
         .join(dst_dir_name)
         .join(format!("{session_id}.jsonl"));
     assert!(moved_file.exists(), "file should exist in target project");
 
     let content = fs::read_to_string(&moved_file).unwrap();
-    assert!(content.contains(target_cwd), "cwd should be updated to target");
-    assert!(!content.contains("/Users/test/src-project"), "old cwd should be replaced");
+    assert!(
+        content.contains(target_cwd),
+        "cwd should be updated to target"
+    );
+    assert!(
+        !content.contains("/Users/test/src-project"),
+        "old cwd should be replaced"
+    );
 
     std::env::remove_var("CLAUDE_HOME");
 }

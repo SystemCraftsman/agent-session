@@ -18,12 +18,15 @@
 use std::collections::hash_map::DefaultHasher;
 use std::fs;
 use std::hash::{Hash, Hasher};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use chrono::{Datelike, SecondsFormat, Utc};
 use serde_json::{json, Value};
 
-use crate::codex::{get_codex_home, load_codex_conversation, newest_rollout_path, save_codex_title};
+use crate::codex::{
+    get_codex_home, load_codex_conversation, newest_rollout_path, save_codex_title_for_path,
+};
 use crate::cursor::{get_cursor_home, load_cursor_conversation, save_cursor_title};
 use crate::discovery::{get_claude_home, load_conversation};
 use crate::session::{Agent, ConversationMessage, MessageRole, Session};
@@ -32,6 +35,7 @@ use crate::session::{Agent, ConversationMessage, MessageRole, Session};
 pub struct CloneResult {
     pub new_id: String,
     pub resume_command: String,
+    pub title: String,
 }
 
 /// Clone a session into `target` and return how to resume/launch the result.
@@ -43,9 +47,17 @@ pub fn clone_to_other_agent(session: &Session, target: Agent) -> Result<CloneRes
     if messages.is_empty() {
         return Err("source conversation is empty; nothing to clone".to_string());
     }
+    // When handing a Claude session to a different agent, carry its Claude Code
+    // memories along so the target keeps the accumulated context, not just the
+    // transcript. A Claude->Claude fork already shares the same memory store.
+    let memories = if session.agent == Agent::Claude && target != Agent::Claude {
+        load_claude_memories(&get_claude_home(), &session.cwd)
+    } else {
+        None
+    };
     match target {
         Agent::Claude => write_claude_session(session, &messages),
-        Agent::Codex => write_codex_session(session, &messages),
+        Agent::Codex => write_codex_session(session, &messages, memories.as_deref()),
         // Cursor targets are context-seeded, not reconstructed into a native
         // file: a same-agent copy reads as a "fork", a cross-agent one as a
         // "seed".
@@ -55,8 +67,60 @@ pub fn clone_to_other_agent(session: &Session, target: Agent) -> Result<CloneRes
             } else {
                 "seed"
             };
-            seed_cursor_session(session, &messages, suffix)
+            seed_cursor_session(session, &messages, suffix, memories.as_deref())
         }
+    }
+}
+
+/// Gather the Claude Code memories for a session's working directory so a
+/// cross-agent transfer can carry them along. Reads the project's `MEMORY.md`
+/// index and every `memory/*.md` fact file under
+/// `<claude_home>/projects/<encoded-cwd>/`, concatenated into one markdown
+/// block. Returns `None` when the project has no memories.
+fn load_claude_memories(claude_home: &Path, cwd: &str) -> Option<String> {
+    let base = claude_home.join("projects").join(encode_claude_dir(cwd));
+
+    let mut out = String::new();
+
+    if let Ok(content) = fs::read_to_string(base.join("MEMORY.md")) {
+        let content = content.trim();
+        if !content.is_empty() {
+            out.push_str("### MEMORY.md (index)\n\n");
+            out.push_str(content);
+            out.push_str("\n\n");
+        }
+    }
+
+    if let Ok(entries) = fs::read_dir(base.join("memory")) {
+        let mut files: Vec<PathBuf> = entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("md"))
+            .collect();
+        files.sort();
+        for path in files {
+            let Ok(content) = fs::read_to_string(&path) else {
+                continue;
+            };
+            let content = content.trim();
+            if content.is_empty() {
+                continue;
+            }
+            let name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("memory.md");
+            out.push_str(&format!("### {name}\n\n"));
+            out.push_str(content);
+            out.push_str("\n\n");
+        }
+    }
+
+    let out = out.trim().to_string();
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
     }
 }
 
@@ -86,6 +150,7 @@ pub fn labeled_title(session: &Session, suffix: &str) -> Option<String> {
 fn write_codex_session(
     session: &Session,
     messages: &[ConversationMessage],
+    memories: Option<&str>,
 ) -> Result<CloneResult, String> {
     let codex_home = get_codex_home();
     let now = Utc::now();
@@ -105,6 +170,20 @@ fn write_codex_session(
         out.push_str(&turn);
         out.push('\n');
     }
+    // Prepend the carried-over Claude memories as a framed context turn so the
+    // resumed Codex session starts with the same background knowledge.
+    if let Some(mem) = memories {
+        let lead = ConversationMessage {
+            role: MessageRole::User,
+            text: format!(
+                "Context carried over from the prior Claude session's memories. \
+                 Treat these as background knowledge, not a new request.\n\n{mem}"
+            ),
+            timestamp: messages.first().map(|m| m.timestamp).unwrap_or(now),
+        };
+        out.push_str(&codex_message_line(&lead));
+        out.push('\n');
+    }
     for m in messages {
         out.push_str(&codex_message_line(m));
         out.push('\n');
@@ -119,18 +198,30 @@ fn write_codex_session(
     fs::create_dir_all(&dir).map_err(|e| format!("failed to create codex session dir: {e}"))?;
     let file_ts = now.format("%Y-%m-%dT%H-%M-%S");
     let path = dir.join(format!("rollout-{file_ts}-{new_id}.jsonl"));
-    fs::write(&path, out).map_err(|e| format!("failed to write codex rollout: {e}"))?;
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .map_err(|e| format!("failed to create codex rollout: {e}"))?;
+    file.write_all(out.as_bytes())
+        .map_err(|e| format!("failed to write codex rollout: {e}"))?;
 
-    // Carry the source title (with a "(reconstruct)" suffix) into Codex's title
-    // sidecar. A title failure must not fail the clone, so ignore its result.
-    if let Some(title) = labeled_title(session, "reconstruct") {
-        let _ = save_codex_title(&codex_home, &new_id, &title);
-    }
+    // Same-agent copies are forks; cross-agent transfers are reconstructions.
+    let suffix = if session.agent == Agent::Codex {
+        "fork"
+    } else {
+        "reconstruct"
+    };
+    let title = labeled_title(session, suffix).unwrap_or_else(|| format!("session ({suffix})"));
+    let _ = save_codex_title_for_path(&codex_home, &path, &title);
 
     let escaped_cwd = session.cwd.replace('\'', "'\\''");
     Ok(CloneResult {
-        resume_command: format!("cd '{escaped_cwd}' && codex resume {new_id}"),
+        resume_command: format!(
+            "cd '{escaped_cwd}' && codex -c 'tui.terminal_title=[]' resume {new_id}"
+        ),
         new_id,
+        title,
     })
 }
 
@@ -166,8 +257,12 @@ fn codex_envelope(
                     obj.insert("timestamp".to_string(), json!(ts));
                     if let Some(p) = obj.get_mut("payload").and_then(|p| p.as_object_mut()) {
                         p.insert("id".to_string(), json!(new_id));
+                        p.insert("session_id".to_string(), json!(new_id));
                         p.insert("cwd".to_string(), json!(session.cwd));
                         p.insert("timestamp".to_string(), json!(ts));
+                        p.remove("forked_from_id");
+                        p.remove("creator_account_id");
+                        p.remove("creator_user_id");
                         p.insert(
                             "git".to_string(),
                             json!({ "branch": session.git_branch.clone().unwrap_or_default() }),
@@ -180,6 +275,8 @@ fn codex_envelope(
                         obj.insert("timestamp".to_string(), json!(ts));
                         if let Some(p) = obj.get_mut("payload").and_then(|p| p.as_object_mut()) {
                             p.insert("cwd".to_string(), json!(session.cwd));
+                            p.remove("turn_id");
+                            p.remove("summary");
                         }
                     }
                     serde_json::to_string(&t).unwrap_or_default()
@@ -195,6 +292,7 @@ fn codex_envelope(
         "type": "session_meta",
         "payload": {
             "id": new_id,
+            "session_id": new_id,
             "timestamp": ts,
             "cwd": session.cwd,
             "originator": "codex_cli_rs",
@@ -280,14 +378,15 @@ fn write_claude_session(
 
     // Carry the source title (with a "(reconstruct)" suffix) as a Claude
     // custom-title line. A title failure must not fail the clone, so ignore it.
-    if let Some(title) = labeled_title(session, "reconstruct") {
-        let _ = crate::titles::save_custom_title(&encoded, &session_id, &title);
-    }
+    let title = labeled_title(session, "reconstruct")
+        .unwrap_or_else(|| "session (reconstruct)".to_string());
+    let _ = crate::titles::save_custom_title(&encoded, &session_id, &title);
 
     let escaped_cwd = session.cwd.replace('\'', "'\\''");
     Ok(CloneResult {
         resume_command: format!("cd '{escaped_cwd}' && claude -r {session_id}"),
         new_id: session_id,
+        title,
     })
 }
 
@@ -313,6 +412,7 @@ fn seed_cursor_session(
     session: &Session,
     messages: &[ConversationMessage],
     suffix: &str,
+    memories: Option<&str>,
 ) -> Result<CloneResult, String> {
     let cursor_home = get_cursor_home();
     let now = Utc::now();
@@ -336,7 +436,9 @@ fn seed_cursor_session(
     // Render the conversation as a readable Markdown transcript.
     let labeled = labeled_title(session, suffix);
     let mut doc = String::new();
-    doc.push_str(&format!("# Imported conversation (from {source_agent})\n\n"));
+    doc.push_str(&format!(
+        "# Imported conversation (from {source_agent})\n\n"
+    ));
     if let Some(title) = &labeled {
         doc.push_str(&format!("Title: {title}\n\n"));
     }
@@ -344,6 +446,17 @@ fn seed_cursor_session(
         "This is a prior conversation carried over from another AI agent. \
          Read it in full, then continue helping from where it left off.\n\n---\n\n",
     );
+    // Carry the source's Claude memories into the import doc so the seeded
+    // Cursor chat inherits the same background knowledge, not just the messages.
+    if let Some(mem) = memories {
+        doc.push_str("# Memories carried over from Claude\n\n");
+        doc.push_str(
+            "These are the accumulated user/project memories from the prior Claude \
+             setup. Treat them as standing context.\n\n",
+        );
+        doc.push_str(mem);
+        doc.push_str("\n\n---\n\n");
+    }
     for m in messages {
         let who = match m.role {
             MessageRole::User => "User",
@@ -371,11 +484,17 @@ fn seed_cursor_session(
     // title (which it derives from the opening prompt and writes to the terminal
     // tab) reflects the source session rather than a generic summary.
     let tab_title = session.title_label();
+    let memory_note = if memories.is_some() {
+        " That file also includes the memories carried over from the prior Claude \
+         setup; treat them as standing context."
+    } else {
+        ""
+    };
     let prompt = format!(
         "{tab_title}\n\n\
          We are continuing a prior {source_agent} conversation. \
          The full transcript is saved at {import_str}. \
-         Please read that file, then continue helping me from where we left off."
+         Please read that file, then continue helping me from where we left off.{memory_note}"
     );
 
     let escaped_cwd = session.cwd.replace('\'', "'\\''");
@@ -384,9 +503,11 @@ fn seed_cursor_session(
         Some(id) => format!("cd '{escaped_cwd}' && cursor-agent --resume {id} '{escaped_prompt}'"),
         None => format!("cd '{escaped_cwd}' && cursor-agent '{escaped_prompt}'"),
     };
+    let title = labeled.unwrap_or_else(|| format!("session ({suffix})"));
     Ok(CloneResult {
         resume_command,
         new_id,
+        title,
     })
 }
 
@@ -462,9 +583,7 @@ fn newest_claude_version(claude_home: &Path) -> Option<String> {
     let content = fs::read_to_string(path).ok()?;
     let first = content.lines().next()?;
     let v: Value = serde_json::from_str(first).ok()?;
-    v.get("version")
-        .and_then(|x| x.as_str())
-        .map(String::from)
+    v.get("version").and_then(|x| x.as_str()).map(String::from)
 }
 
 /// Generate a v4-formatted UUID string deterministically from `seed`.

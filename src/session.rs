@@ -56,7 +56,10 @@ impl Session {
             // Codex resolves to the user's `codex` shell function when run
             // through an interactive shell, mirroring the `claude` wrapper.
             Agent::Codex => {
-                format!("cd '{}' && codex resume {}", escaped_cwd, self.id)
+                format!(
+                    "cd '{}' && codex -c 'tui.terminal_title=[]' resume {}",
+                    escaped_cwd, self.id
+                )
             }
             // Claude resolves to the user's `claude` shell function when run
             // through an interactive shell.
@@ -99,24 +102,81 @@ impl Session {
         }
     }
 
-    /// Short human label for a terminal tab title, prefixed with the owning
-    /// agent, e.g. `Codex: Refactor the payment module`. Uses the custom title
-    /// when set, otherwise the first message, truncated to a sensible width.
+    /// Like [`Session::resume_command_with`], but also honours a native Codex
+    /// `--profile` for Codex sessions: a tagged Codex session resumes with
+    /// `codex --profile <name> resume <id>`. Claude still uses its shell
+    /// launcher and Cursor is unaffected.
+    pub fn resume_command_with_profiles(
+        &self,
+        claude_launcher: &str,
+        codex_profile: Option<&str>,
+    ) -> String {
+        match self.agent {
+            Agent::Codex => match codex_profile.filter(|p| !p.is_empty()) {
+                Some(p) => {
+                    let escaped_cwd = self.cwd.replace('\'', "'\\''");
+                    format!(
+                        "cd '{}' && codex --profile {} -c 'tui.terminal_title=[]' resume {}",
+                        escaped_cwd, p, self.id
+                    )
+                }
+                None => self.resume_command(),
+            },
+            _ => self.resume_command_with(claude_launcher),
+        }
+    }
+    /// Short terminal label using provider and title. The message portion is
+    /// normalized and truncated to a sensible width.
     pub fn title_label(&self) -> String {
+        self.title_label_with_profile(None)
+    }
+
+    /// Build a terminal label such as `[CODEX] Refactor module [work]`.
+    pub fn title_label_with_profile(&self, profile: Option<&str>) -> String {
         let base = self
             .custom_title
             .as_deref()
             .map(str::trim)
             .filter(|t| !t.is_empty())
             .unwrap_or_else(|| self.first_message.trim());
-        let truncated: String = base.chars().take(60).collect();
-        let truncated = truncated.trim();
-        if truncated.is_empty() {
-            format!("{} session", self.agent.label())
-        } else {
-            format!("{}: {}", self.agent.label(), truncated)
-        }
+        format_title_label(self.agent, base, profile)
     }
+}
+
+/// Format a session label consistently for terminal titles and newly created
+/// cross-agent sessions.
+pub fn format_title_label(agent: Agent, title: &str, profile: Option<&str>) -> String {
+    let normalized = title.split_whitespace().collect::<Vec<_>>().join(" ");
+    let truncated: String = if normalized.chars().count() > 60 {
+        match [" (fork)", " (seed)", " (reconstruct)"]
+            .iter()
+            .find(|suffix| normalized.ends_with(**suffix))
+        {
+            Some(suffix) => {
+                let base = normalized.strip_suffix(suffix).unwrap_or(&normalized);
+                format!(
+                    "{}{}",
+                    base.chars()
+                        .take(60 - suffix.chars().count())
+                        .collect::<String>(),
+                    suffix
+                )
+            }
+            None => normalized.chars().take(60).collect(),
+        }
+    } else {
+        normalized
+    };
+    let title = if truncated.is_empty() {
+        "session"
+    } else {
+        truncated.trim()
+    };
+    let mut label = format!("[{}] {title}", agent.label().to_ascii_uppercase());
+    if let Some(profile) = profile.map(str::trim).filter(|p| !p.is_empty()) {
+        label.push_str(&format!(" [{profile}]"));
+    }
+    label
 }
 
 /// A single line from a session JSONL file.
@@ -434,27 +494,83 @@ mod tests {
 
     #[test]
     fn title_label_prefers_custom_title_and_prefixes_agent() {
-        let s = session(Agent::Codex, Some("Refactor payments"), "ignored first message");
-        assert_eq!(s.title_label(), "Codex: Refactor payments");
+        let s = session(
+            Agent::Codex,
+            Some("Refactor payments"),
+            "ignored first message",
+        );
+        assert_eq!(s.title_label(), "[CODEX] Refactor payments");
     }
 
     #[test]
     fn title_label_falls_back_to_first_message() {
         let s = session(Agent::Claude, None, "  Fix the flaky test  ");
-        assert_eq!(s.title_label(), "Claude: Fix the flaky test");
+        assert_eq!(s.title_label(), "[CLAUDE] Fix the flaky test");
     }
 
     #[test]
     fn title_label_truncates_long_text_to_60_chars() {
         let long = "x".repeat(200);
         let s = session(Agent::Cursor, None, &long);
-        let expected = format!("Cursor: {}", "x".repeat(60));
+        let expected = format!("[CURSOR] {}", "x".repeat(60));
         assert_eq!(s.title_label(), expected);
     }
 
     #[test]
     fn title_label_handles_empty_text() {
         let s = session(Agent::Cursor, Some("   "), "");
-        assert_eq!(s.title_label(), "Cursor session");
+        assert_eq!(s.title_label(), "[CURSOR] session");
+    }
+
+    #[test]
+    fn title_label_matches_provider_title_profile_order() {
+        let s = session(Agent::Codex, Some("Agent Session"), "ignored");
+        assert_eq!(
+            s.title_label_with_profile(Some("work")),
+            "[CODEX] Agent Session [work]"
+        );
+    }
+
+    #[test]
+    fn terminal_title_keeps_fork_suffix_when_truncated() {
+        let label = format_title_label(Agent::Codex, &format!("{} (fork)", "x".repeat(100)), None);
+        assert!(label.ends_with(" (fork)"));
+        assert_eq!(label.trim_start_matches("[CODEX] ").chars().count(), 60);
+    }
+
+    #[test]
+    fn title_label_flattens_whitespace_for_terminal_safety() {
+        let s = session(Agent::Claude, None, "Fix\nTurkish  text");
+        assert_eq!(s.title_label(), "[CLAUDE] Fix Turkish text");
+    }
+
+    #[test]
+    fn codex_resume_injects_native_profile_when_tagged() {
+        let s = session(Agent::Codex, None, "hi");
+        // Tagged Codex sessions resume with the native `--profile` flag.
+        assert_eq!(
+            s.resume_command_with_profiles("claude", Some("work")),
+            "cd '/tmp/proj' && codex --profile work -c 'tui.terminal_title=[]' resume id"
+        );
+        // Untagged (or empty) falls back to the plain resume command.
+        assert_eq!(
+            s.resume_command_with_profiles("claude", None),
+            s.resume_command()
+        );
+        assert_eq!(
+            s.resume_command_with_profiles("claude", Some("")),
+            s.resume_command()
+        );
+    }
+
+    #[test]
+    fn claude_resume_ignores_codex_profile_and_uses_launcher() {
+        let s = session(Agent::Claude, None, "hi");
+        // A Claude session still routes through its shell launcher; the codex
+        // profile argument is irrelevant to it.
+        assert_eq!(
+            s.resume_command_with_profiles("_claude_run_work", Some("work")),
+            "cd '/tmp/proj' && _claude_run_work -r id"
+        );
     }
 }

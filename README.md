@@ -47,6 +47,8 @@ Titles travel with the clone: a same-agent copy is labeled `(fork)` and a cross-
 
 Beyond browsing, you can rename sessions with custom titles, archive sessions out of the active list without deleting them, and move a session to a different project directory.
 
+New Claude and Codex sessions ask which profile to use. The selected profile is saved as soon as the session appears, so another terminal can list and resume it with the same profile while it is still running. Use `Ctrl-p` to change a session's saved profile.
+
 ### Theme And Time Filters
 
 Rendering auto-detects a dark or light terminal background, with `--dark` / `--light` overrides. Use `--since 7d` and `--last 50` to scope which sessions load.
@@ -89,7 +91,7 @@ Action shortcuts use a `Ctrl` prefix so that plain typing always goes to the sea
 | `Enter`             | Open the selected session's conversation       |
 | `Tab`               | Toggle flat / grouped-by-project view          |
 | `Ctrl-t`            | Rename the selected session (custom title)     |
-| `Ctrl-n`            | Start a new session in the selected project    |
+| `Ctrl-n`            | Start a new session; choose agent and profile  |
 | `Ctrl-a`            | Archive the selected session                   |
 | `Ctrl-v`            | Move the session to another project            |
 | `Ctrl-f`            | Fork or transfer the session to another agent  |

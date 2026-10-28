@@ -37,6 +37,32 @@ pub fn discover_codex_sessions(codex_home: &Path) -> Vec<Session> {
     discover_codex_in(codex_home, "sessions")
 }
 
+/// Read only rollout headers so launch tracking never rescans conversations.
+pub(crate) fn discover_codex_session_locations(codex_home: &Path) -> Vec<(String, String)> {
+    let mut files = Vec::new();
+    collect_rollout_files(&codex_home.join("sessions"), &mut files);
+    files
+        .into_iter()
+        .filter_map(|path| {
+            let reader = BufReader::new(fs::File::open(path).ok()?);
+            for line in reader.lines().take(50) {
+                let Ok(line) = line else { continue };
+                let Ok(value) = serde_json::from_str::<Value>(&line) else {
+                    continue;
+                };
+                if value.get("type").and_then(Value::as_str) == Some("session_meta") {
+                    let payload = value.get("payload")?;
+                    return Some((
+                        payload.get("id")?.as_str()?.to_string(),
+                        payload.get("cwd")?.as_str()?.to_string(),
+                    ));
+                }
+            }
+            None
+        })
+        .collect()
+}
+
 /// Discover archived Codex sessions under `codex_home/sessions-archive/`, where
 /// [`archive_codex_session`] moves rollouts. Empty when nothing is archived.
 pub fn discover_archived_codex_sessions(codex_home: &Path) -> Vec<Session> {
@@ -55,20 +81,38 @@ fn discover_codex_in(codex_home: &Path, subdir: &str) -> Vec<Session> {
     let mut rollout_files: Vec<PathBuf> = Vec::new();
     collect_rollout_files(&sessions_dir, &mut rollout_files);
 
-    let mut sessions: Vec<Session> = rollout_files
+    let rollouts: Vec<(Session, Option<String>)> = rollout_files
         .par_iter()
         .filter_map(|path| parse_rollout_file(path))
         .collect();
 
-    // Apply custom titles from the sidecar store (rollout files stay untouched).
+    // Apply rollout-specific titles first, with legacy ID entries as fallback.
     let titles = load_codex_titles(codex_home);
-    if !titles.is_empty() {
-        for s in &mut sessions {
-            if let Some(t) = titles.get(&s.id) {
-                s.custom_title = Some(t.clone());
-            }
-        }
-    }
+    let mut sessions: Vec<Session> = rollouts
+        .into_iter()
+        .map(|(mut session, forked_from)| {
+            let saved = session
+                .source_path
+                .as_deref()
+                .and_then(|path| codex_title_key(codex_home, Path::new(path)))
+                .and_then(|key| titles.get(&key))
+                .or_else(|| titles.get(&session.id));
+            session.custom_title = saved
+                .filter(|title| !title.is_empty())
+                .cloned()
+                .or_else(|| {
+                    forked_from.map(|_| {
+                        let base = session.first_message.trim();
+                        if base.is_empty() {
+                            "Codex session (fork)".to_string()
+                        } else {
+                            format!("{base} (fork)")
+                        }
+                    })
+                });
+            session
+        })
+        .collect();
 
     sessions.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
     sessions
@@ -83,6 +127,14 @@ fn codex_titles_path(codex_home: &Path) -> PathBuf {
     codex_home.join("agent-session-titles.json")
 }
 
+fn codex_title_key(codex_home: &Path, source_path: &Path) -> Option<String> {
+    let relative = source_path
+        .strip_prefix(codex_home.join("sessions"))
+        .or_else(|_| source_path.strip_prefix(codex_home.join("sessions-archive")))
+        .ok()?;
+    Some(format!("rollout:{}", relative.to_string_lossy()))
+}
+
 /// Legacy sidecar path from the tool's former `cc-session` name. Read as a
 /// fallback so titles saved before the rename are not lost.
 fn legacy_codex_titles_path(codex_home: &Path) -> PathBuf {
@@ -94,15 +146,15 @@ fn legacy_codex_titles_path(codex_home: &Path) -> PathBuf {
 /// fallback when the current sidecar is absent.
 pub fn load_codex_titles(codex_home: &Path) -> HashMap<String, String> {
     let read = |p: PathBuf| fs::read_to_string(p).ok();
-    match read(codex_titles_path(codex_home))
-        .or_else(|| read(legacy_codex_titles_path(codex_home)))
+    match read(codex_titles_path(codex_home)).or_else(|| read(legacy_codex_titles_path(codex_home)))
     {
         Some(data) => serde_json::from_str(&data).unwrap_or_default(),
         None => HashMap::new(),
     }
 }
 
-/// Persist a custom title for a Codex session. An empty title removes the entry.
+/// Persist a legacy ID-keyed title. New UI titles use rollout-specific keys.
+#[allow(dead_code)]
 pub fn save_codex_title(codex_home: &Path, session_id: &str, title: &str) -> Result<(), String> {
     let mut titles = load_codex_titles(codex_home);
     if title.is_empty() {
@@ -110,7 +162,25 @@ pub fn save_codex_title(codex_home: &Path, session_id: &str, title: &str) -> Res
     } else {
         titles.insert(session_id.to_string(), title.to_string());
     }
-    let serialized = serde_json::to_string_pretty(&titles)
+    write_codex_titles(codex_home, &titles)
+}
+
+/// Save a title for one rollout rather than every file sharing a Codex ID.
+/// An empty value shadows a legacy ID title without changing other rollouts.
+pub fn save_codex_title_for_path(
+    codex_home: &Path,
+    source_path: &Path,
+    title: &str,
+) -> Result<(), String> {
+    let key = codex_title_key(codex_home, source_path)
+        .ok_or("Codex rollout is outside the sessions directory")?;
+    let mut titles = load_codex_titles(codex_home);
+    titles.insert(key, title.to_string());
+    write_codex_titles(codex_home, &titles)
+}
+
+fn write_codex_titles(codex_home: &Path, titles: &HashMap<String, String>) -> Result<(), String> {
+    let serialized = serde_json::to_string_pretty(titles)
         .map_err(|e| format!("failed to encode titles: {e}"))?;
     fs::write(codex_titles_path(codex_home), serialized)
         .map_err(|e| format!("failed to write titles file: {e}"))
@@ -256,11 +326,12 @@ fn message_text(payload: &Value) -> String {
 /// Parse a single Codex rollout file into a `Session`.
 ///
 /// Returns `None` if the file has no `session_meta` record.
-fn parse_rollout_file(path: &Path) -> Option<Session> {
+fn parse_rollout_file(path: &Path) -> Option<(Session, Option<String>)> {
     let file = fs::File::open(path).ok()?;
     let reader = BufReader::new(file);
 
     let mut id: Option<String> = None;
+    let mut forked_from_id: Option<String> = None;
     let mut cwd = String::new();
     let mut git_branch: Option<String> = None;
     let mut timestamp: DateTime<Utc> = Utc::now();
@@ -295,6 +366,10 @@ fn parse_rollout_file(path: &Path) -> Option<Session> {
                     .get("id")
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string());
+                forked_from_id = payload
+                    .get("forked_from_id")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
                 cwd = payload
                     .get("cwd")
                     .and_then(|v| v.as_str())
@@ -364,7 +439,7 @@ fn parse_rollout_file(path: &Path) -> Option<Session> {
 
     let project_exists = Path::new(&cwd).exists();
 
-    Some(Session {
+    let session = Session {
         id,
         // For Codex, project_path holds the cwd so sessions group by working
         // directory; the rollout file location lives in source_path.
@@ -378,7 +453,8 @@ fn parse_rollout_file(path: &Path) -> Option<Session> {
         custom_title: None,
         agent: Agent::Codex,
         source_path: Some(path.to_string_lossy().to_string()),
-    })
+    };
+    Some((session, forked_from_id))
 }
 
 /// Parse a timestamp string, tolerating both RFC 3339 and space-separated forms.

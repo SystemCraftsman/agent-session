@@ -20,20 +20,18 @@ fn agent_badge(agent: Agent) -> (&'static str, Color) {
     }
 }
 
-/// Return the per-session profile badge (with trailing space) and its color for
-/// a Claude session tagged with a work/personal profile. Returns an empty marker
-/// for untagged or non-Claude sessions, so nothing is drawn for them.
-fn profile_badge(
-    session: &crate::session::Session,
-    profiles: &std::collections::HashMap<String, String>,
-) -> (String, Color) {
-    if session.agent != Agent::Claude {
+/// Return the effective profile badge, including its leading space, for a
+/// Claude or Codex session. Explicit tags override the shell default before
+/// this helper is called. Cursor sessions never draw a profile badge.
+fn profile_badge(session: &crate::session::Session, profile: Option<&str>) -> (String, Color) {
+    if !matches!(session.agent, Agent::Claude | Agent::Codex) {
         return (String::new(), Color::Reset);
     }
-    match profiles.get(&session.id).map(String::as_str) {
-        Some("work") => ("[work] ".to_string(), Color::Green),
-        Some("personal") => ("[personal] ".to_string(), Color::Yellow),
-        _ => (String::new(), Color::Reset),
+    match profile {
+        Some("work") => (" [work]".to_string(), Color::Green),
+        Some("personal") => (" [personal]".to_string(), Color::Yellow),
+        Some(other) => (format!(" [{other}]"), Color::Cyan),
+        None => (String::new(), Color::Reset),
     }
 }
 
@@ -65,6 +63,9 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     }
     if app.mode == Mode::NewSelectAgent {
         render_new_agent_picker(frame, app, area);
+    }
+    if app.mode == Mode::NewSelectProfile {
+        render_new_profile_picker(frame, app, area);
     }
     if app.mode == Mode::ProfileSelect {
         render_profile_picker(frame, app, area);
@@ -111,7 +112,7 @@ fn render_flat_session_list(frame: &mut Frame, app: &App, area: Rect) {
 
         let (agent_tag, agent_color) = agent_badge(session.agent);
         let agent_tag_len = agent_tag.chars().count();
-        let (prof_tag, prof_color) = profile_badge(session, &app.session_profiles);
+        let (prof_tag, prof_color) = profile_badge(session, app.effective_session_profile(session));
         let prof_len = prof_tag.chars().count();
 
         let label = app.session_display_label(session);
@@ -119,8 +120,7 @@ fn render_flat_session_list(frame: &mut Frame, app: &App, area: Rect) {
             width.saturating_sub(cursor_len + agent_tag_len + prof_len + right_len + 2);
         let msg = truncate_str(&label, max_msg_len);
         let msg_len = msg.chars().count();
-        let pad =
-            width.saturating_sub(cursor_len + agent_tag_len + prof_len + msg_len + right_len);
+        let pad = width.saturating_sub(cursor_len + agent_tag_len + prof_len + msg_len + right_len);
         let padding = " ".repeat(pad);
 
         let msg_style = if is_selected {
@@ -134,10 +134,12 @@ fn render_flat_session_list(frame: &mut Frame, app: &App, area: Rect) {
 
         let mut spans = vec![Span::styled(cursor, cursor_style)];
         spans.push(Span::styled(agent_tag, Style::default().fg(agent_color)));
+        spans.extend(highlight_terms(&msg, &term_refs, msg_style, &app.theme));
+        // Profile badge trails the title so forks of the same title are easy to
+        // tell apart by their `[work]`/`[personal]` suffix.
         if !prof_tag.is_empty() {
             spans.push(Span::styled(prof_tag, Style::default().fg(prof_color)));
         }
-        spans.extend(highlight_terms(&msg, &term_refs, msg_style, &app.theme));
         spans.push(Span::raw(padding));
         spans.push(Span::styled(right, dim));
 
@@ -157,7 +159,11 @@ fn render_flat_session_list(frame: &mut Frame, app: &App, area: Rect) {
         .border_style(border_style)
         .title(format!(
             " Agent Session{} ({}/{}) ",
-            if app.viewing_archived { " [ARCHIVED]" } else { "" },
+            if app.viewing_archived {
+                " [ARCHIVED]"
+            } else {
+                ""
+            },
             app.display_entries.len(),
             app.sessions.len()
         ))
@@ -254,7 +260,8 @@ fn render_grouped_session_list(frame: &mut Frame, app: &App, area: Rect) {
 
                 let (agent_tag, agent_color) = agent_badge(session.agent);
                 let agent_tag_len = agent_tag.chars().count();
-                let (prof_tag, prof_color) = profile_badge(session, &app.session_profiles);
+                let (prof_tag, prof_color) =
+                    profile_badge(session, app.effective_session_profile(session));
                 let prof_len = prof_tag.chars().count();
 
                 let label = app.session_display_label(session);
@@ -279,10 +286,12 @@ fn render_grouped_session_list(frame: &mut Frame, app: &App, area: Rect) {
 
                 let mut spans = vec![Span::raw(indent), Span::styled(cursor, cursor_style)];
                 spans.push(Span::styled(agent_tag, Style::default().fg(agent_color)));
+                spans.extend(highlight_terms(&msg, &term_refs, msg_style, &app.theme));
+                // Profile badge trails the title so forks of the same title are
+                // easy to tell apart by their `[work]`/`[personal]` suffix.
                 if !prof_tag.is_empty() {
                     spans.push(Span::styled(prof_tag, Style::default().fg(prof_color)));
                 }
-                spans.extend(highlight_terms(&msg, &term_refs, msg_style, &app.theme));
                 spans.push(Span::raw(padding));
                 spans.push(Span::styled(right, dim));
 
@@ -309,7 +318,11 @@ fn render_grouped_session_list(frame: &mut Frame, app: &App, area: Rect) {
         .border_style(border_style)
         .title(format!(
             " Agent Session{} ({}/{}) \u{2500} {} projects ",
-            if app.viewing_archived { " [ARCHIVED]" } else { "" },
+            if app.viewing_archived {
+                " [ARCHIVED]"
+            } else {
+                ""
+            },
             session_count,
             app.sessions.len(),
             app.project_groups.len(),
@@ -443,8 +456,7 @@ fn render_fork_picker(frame: &mut Frame, app: &App, area: Rect) {
             crate::session::Agent::Cursor => "Cursor",
         };
         // Cursor is cloud-backed, so any Cursor target is context-seeded ("seed").
-        // A same-agent Claude/Codex target is a native fork; anything else is a
-        // native reconstruction.
+        // Claude forks natively; Codex forks use a reconstructed rollout.
         let kind = if *agent == crate::session::Agent::Cursor {
             "seed"
         } else if *agent == state.session.agent {
@@ -529,7 +541,61 @@ fn render_new_agent_picker(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(paragraph, popup_area);
 }
 
-/// Render the per-session Claude profile picker (work / personal / clear).
+/// Render the profile picker used before a new session is launched.
+fn render_new_profile_picker(frame: &mut Frame, app: &App, area: Rect) {
+    let state = match &app.new_profile_state {
+        Some(state) => state,
+        None => return,
+    };
+    let max_w = 44u16.min(area.width.saturating_sub(4)).max(20);
+    let max_h = (state.options.len() as u16 + 2)
+        .min(area.height.saturating_sub(4))
+        .max(4);
+    let popup_area = Rect::new(
+        area.width.saturating_sub(max_w) / 2,
+        area.height.saturating_sub(max_h) / 2,
+        max_w,
+        max_h,
+    );
+    frame.render_widget(ratatui::widgets::Clear, popup_area);
+
+    let inner_w = max_w.saturating_sub(2) as usize;
+    let lines: Vec<Line> = state
+        .options
+        .iter()
+        .enumerate()
+        .map(|(index, profile)| {
+            let selected = index == state.selected;
+            let prefix = if selected { "\u{27A4} " } else { "  " };
+            let style = if selected {
+                Style::default().fg(app.theme.cursor_color).bold()
+            } else {
+                Style::default().fg(app.theme.text)
+            };
+            let padding = " "
+                .repeat(inner_w.saturating_sub(prefix.chars().count() + profile.chars().count()));
+            let line = Line::from(vec![
+                Span::styled(prefix, style),
+                Span::styled(profile.as_str(), style),
+                Span::raw(padding),
+            ]);
+            if selected {
+                line.patch_style(Style::default().bg(app.theme.selected_bg))
+            } else {
+                line
+            }
+        })
+        .collect();
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!(" New {} profile ", state.agent.label()))
+        .border_style(Style::default().fg(app.theme.cursor_color))
+        .title_style(Style::default().fg(app.theme.cursor_color).bold());
+    frame.render_widget(Paragraph::new(Text::from(lines)).block(block), popup_area);
+}
+
+/// Render the per-session profile picker (Claude launcher profiles or Codex
+/// native `--profile` names, plus a "clear" choice).
 fn render_profile_picker(frame: &mut Frame, app: &App, area: Rect) {
     let state = match &app.profile_state {
         Some(s) => s,
@@ -1273,6 +1339,21 @@ fn render_status_bar(frame: &mut Frame, app: &App, area: Rect) {
                 Span::styled(" cancel", dim),
             ])
         }
+        Mode::NewSelectProfile => {
+            let key_style = Style::default().fg(Color::White).bold();
+            Line::from(vec![
+                Span::styled(
+                    " New session profile: ",
+                    Style::default().fg(app.theme.cursor_color).bold(),
+                ),
+                Span::styled("↑↓", key_style),
+                Span::styled(" navigate  ", dim),
+                Span::styled("Enter", key_style),
+                Span::styled(" confirm  ", dim),
+                Span::styled("Esc", key_style),
+                Span::styled(" back", dim),
+            ])
+        }
         Mode::ProfileSelect => {
             let key_style = Style::default().fg(Color::White).bold();
             Line::from(vec![
@@ -1602,41 +1683,56 @@ fn highlight_terms<'a>(
         return vec![Span::styled(text.to_string(), base_style)];
     }
 
-    let text_lower = text.to_lowercase();
-    let len = text.len();
+    // Match in char space, not byte space: `to_lowercase()` can change byte
+    // length for non-ASCII input (e.g. Turkish 'İ'), so byte offsets from the
+    // lowercased string drift from the original and slicing `&text[..]` at them
+    // can land inside a multi-byte char and panic. Lowercasing each char to its
+    // first char keeps a 1:1 char alignment with the original text.
+    let chars: Vec<char> = text.chars().collect();
+    let lower: Vec<char> = chars
+        .iter()
+        .map(|c| c.to_lowercase().next().unwrap_or(*c))
+        .collect();
 
-    let mut matched = vec![false; len];
+    let mut matched = vec![false; chars.len()];
     for term in terms {
         if term.is_empty() {
             continue;
         }
-        let term_lower = term.to_lowercase();
+        let term_lower: Vec<char> = term
+            .chars()
+            .map(|c| c.to_lowercase().next().unwrap_or(c))
+            .collect();
+        if term_lower.is_empty() || term_lower.len() > lower.len() {
+            continue;
+        }
         let mut start = 0;
-        while let Some(pos) = text_lower[start..].find(&term_lower) {
-            let abs_pos = start + pos;
-            for m in matched.iter_mut().skip(abs_pos).take(term_lower.len()) {
-                *m = true;
+        while start + term_lower.len() <= lower.len() {
+            if lower[start..start + term_lower.len()] == term_lower[..] {
+                for m in matched.iter_mut().skip(start).take(term_lower.len()) {
+                    *m = true;
+                }
             }
-            start = abs_pos + 1;
+            start += 1;
         }
     }
 
     let highlight_style = base_style.bg(theme.search_highlight_bg);
     let mut spans = Vec::new();
     let mut i = 0;
-    while i < len {
+    while i < chars.len() {
         let is_match = matched[i];
         let run_start = i;
-        while i < len && matched[i] == is_match {
+        while i < chars.len() && matched[i] == is_match {
             i += 1;
         }
-        let segment = &text[run_start..i];
+        let segment: String = chars[run_start..i].iter().collect();
         let style = if is_match {
             highlight_style
         } else {
             base_style
         };
-        spans.push(Span::styled(segment.to_string(), style));
+        spans.push(Span::styled(segment, style));
     }
 
     if spans.is_empty() {
@@ -1657,5 +1753,33 @@ fn format_project_label(session: &crate::session::Session) -> String {
     match &session.git_branch {
         Some(branch) if !branch.is_empty() => format!("{} ({})", session.project_name, branch),
         _ => session.project_name.clone(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Highlighting must stay on UTF-8 char boundaries: multi-byte input such as
+    /// Turkish text used to panic when a byte-space cut landed inside a char.
+    #[test]
+    fn highlight_terms_handles_multibyte_text() {
+        let theme = crate::theme::Theme::dark();
+        let base = Style::default();
+
+        // Regression: a term whose lowercase byte length differs from the
+        // original ('İ') no longer drifts the offsets into a mid-char slice.
+        let spans = highlight_terms("Ödemeleri İncele", &["incele"], base, &theme);
+        let joined: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(joined, "Ödemeleri İncele");
+
+        // No match still returns the text intact, unsliced.
+        let spans = highlight_terms("çğışöü", &["zzz"], base, &theme);
+        let joined: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(joined, "çğışöü");
+
+        // A plain ASCII match still highlights (splits into >1 span).
+        let spans = highlight_terms("payment module", &["module"], base, &theme);
+        assert!(spans.len() > 1);
     }
 }
