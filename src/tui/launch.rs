@@ -13,6 +13,7 @@ pub(super) struct NewSessionLaunch {
     cwd: String,
     home: PathBuf,
     existing_ids: HashSet<String>,
+    report_missing_session: bool,
 }
 
 impl NewSessionLaunch {
@@ -23,9 +24,42 @@ impl NewSessionLaunch {
             cwd,
             home,
             existing_ids: HashSet::new(),
+            report_missing_session: true,
         };
         launch.existing_ids = launch.locations().into_iter().map(|(id, _)| id).collect();
         launch
+    }
+
+    pub(super) fn from_codex_command(command: &str, home: PathBuf) -> Option<Self> {
+        let (directory, arguments) = command.rsplit_once(" && codex ")?;
+        let cwd = directory
+            .strip_prefix("cd '")?
+            .strip_suffix('\'')?
+            .replace("'\\''", "'");
+        let mut arguments = arguments.split_whitespace();
+        let profile = match arguments.next()? {
+            "--profile" | "-p" => arguments.next()?,
+            _ => return None,
+        };
+        if !crate::router::codex_config_profiles(&home)
+            .iter()
+            .any(|known| known == profile)
+        {
+            return None;
+        }
+        let arguments: Vec<_> = arguments.collect();
+        if !arguments
+            .iter()
+            .any(|argument| matches!(*argument, "resume" | "fork"))
+        {
+            return None;
+        }
+
+        let mut launch = Self::new(Agent::Codex, profile.into(), cwd, home);
+        // A shell wrapper can turn a cross-provider resume into a native fork.
+        // Ordinary resumes create no new session and must not report an error.
+        launch.report_missing_session = arguments.contains(&"fork");
+        Some(launch)
     }
 
     fn locations(&self) -> Vec<(String, String)> {
@@ -106,7 +140,7 @@ pub(super) fn wait_for_agent(
         if let Some(status) = status {
             match saved {
                 Err(error) => eprintln!("Failed to remember new session profile: {error}"),
-                Ok(false) if status.success() => {
+                Ok(false) if status.success() && launch.report_missing_session => {
                     eprintln!("Failed to remember new session profile: new session metadata was not found");
                 }
                 _ => {}
@@ -125,6 +159,72 @@ mod tests {
     use std::process::{Command, Stdio};
     use std::sync::mpsc;
     use std::time::Instant;
+
+    #[test]
+    fn provider_switch_fork_keeps_the_selected_codex_profile() {
+        let home = tempfile::tempdir().unwrap();
+        fs::write(home.path().join("work.config.toml"), "").unwrap();
+        fs::write(home.path().join("work-enmaas.config.toml"), "").unwrap();
+        write_session(home.path(), Agent::Codex, "original", "/tmp/project");
+        let command = "cd '/tmp/project' && codex --profile work-enmaas -c 'tui.terminal_title=[]' resume original";
+        let launch = NewSessionLaunch::from_codex_command(command, home.path().into()).unwrap();
+        assert!(!launch.report_missing_session);
+        assert!(!launch.try_save_profile().unwrap());
+
+        write_session(home.path(), Agent::Codex, "enmaas-fork", "/tmp/project");
+        assert!(launch.try_save_profile().unwrap());
+        let profiles = crate::router::load_session_profiles(home.path());
+        assert_eq!(
+            profiles.get("enmaas-fork").map(String::as_str),
+            Some("work-enmaas")
+        );
+        assert!(!profiles.contains_key("original"));
+        let session = crate::codex::discover_codex_sessions(home.path())
+            .into_iter()
+            .find(|session| session.id == "enmaas-fork")
+            .unwrap();
+        let resume = session.resume_command_with_profiles(
+            "_claude_run_work",
+            profiles.get(&session.id).map(String::as_str),
+        );
+        assert!(resume.contains("codex --profile work-enmaas"));
+        assert!(resume.ends_with("resume enmaas-fork"));
+    }
+
+    #[test]
+    fn normal_codex_resume_does_not_require_a_new_session() {
+        let home = tempfile::tempdir().unwrap();
+        fs::write(home.path().join("work-enmaas.config.toml"), "").unwrap();
+        let launch = NewSessionLaunch::from_codex_command(
+            "cd '/tmp/project' && codex --profile work-enmaas resume existing",
+            home.path().into(),
+        )
+        .unwrap();
+        assert!(!launch.report_missing_session);
+        let mut child = Command::new("sh").args(["-c", "exit 0"]).spawn().unwrap();
+        assert!(wait_for_agent(&mut child, Some(&launch)).unwrap().success());
+        assert!(crate::router::load_session_profiles(home.path()).is_empty());
+    }
+
+    #[test]
+    fn codex_command_tracking_decodes_cwd_and_distinguishes_explicit_forks() {
+        let home = tempfile::tempdir().unwrap();
+        fs::write(home.path().join("work-enmaas.config.toml"), "").unwrap();
+        let launch = NewSessionLaunch::from_codex_command(
+            "cd '/tmp/owner'\\''s project' && codex --profile work-enmaas fork original",
+            home.path().into(),
+        )
+        .unwrap();
+        assert_eq!(launch.cwd, "/tmp/owner's project");
+        assert!(launch.report_missing_session);
+        for command in [
+            "cd '/tmp/project' && claude -r original",
+            "cd '/tmp/project' && codex resume original",
+            "cd '/tmp/project' && codex --profile unknown resume original",
+        ] {
+            assert!(NewSessionLaunch::from_codex_command(command, home.path().into()).is_none());
+        }
+    }
 
     fn write_session(home: &Path, agent: Agent, id: &str, cwd: &str) {
         let (path, body) = match agent {

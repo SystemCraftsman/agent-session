@@ -1662,6 +1662,10 @@ pub fn run(
                         break;
                     }
                     Action::CopyCommand { cmd, title } | Action::ForkSession { cmd, title } => {
+                        new_session_launch = NewSessionLaunch::from_codex_command(
+                            &cmd,
+                            crate::codex::get_codex_home(),
+                        );
                         deferred_command = Some((cmd, title));
                         break;
                     }
